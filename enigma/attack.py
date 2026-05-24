@@ -7,25 +7,22 @@ Implements the algorithm described in
   2. Propagate German bigram exclusions to prune candidates.
   3. Sweep over (reflector, rotor selection/order, initial positions, rings)
      and for each trajectory decrypt the ciphertext, reject early on
-     exclusory bigrams, and score against the language model.
+     exclusory bigrams / IC, and score against the language model.
   4. Infer plugboard swaps from residual frequency deviation.
 
-The implementation is intended to be correct first and fast second; the
-trajectory loop is deliberately structured to make early termination cheap
-so that the inner search remains tractable.
+The inner loop uses ``fast_trajectory`` to avoid per-letter machine
+cloning. The attack works against both M3 (3 rotors) and M4 (4 rotors)
+configurations.
 """
 
 from __future__ import annotations
 
 import itertools
 from dataclasses import dataclass, field
-from typing import Iterable, Sequence
+from typing import Sequence
 
 from enigma.language import (
-    GERMAN_IC,
-    RANDOM_IC,
     LanguageModel,
-    UNIGRAM_FREQ,
     index_of_coincidence,
 )
 from enigma.simulator import (
@@ -33,6 +30,12 @@ from enigma.simulator import (
     Plugboard,
     REFLECTORS,
     ROTORS,
+    fast_trajectory,
+    M3_ROTORS,
+    M3_REFLECTORS,
+    M4_REFLECTORS,
+    NAVAL_ROTORS,
+    GREEK_ROTORS,
 )
 
 
@@ -56,13 +59,11 @@ def propagate_bigrams(
     changed = True
     while changed:
         changed = False
-        # Forward
         for t in range(L - 1):
             for a in list(cands[t]):
                 if not any(not model.excluded[a][b] for b in cands[t + 1]):
                     cands[t].discard(a)
                     changed = True
-        # Backward
         for t in range(L - 1, 0, -1):
             for b in list(cands[t]):
                 if not any(not model.excluded[a][b] for a in cands[t - 1]):
@@ -84,44 +85,29 @@ class AttackResult:
     positions: tuple[int, int, int]
     ring_settings: tuple[int, int, int]
     plugboard_pairs: list[tuple[str, str]] = field(default_factory=list)
+    fourth_rotor_name: str | None = None
+    fourth_position: int = 0
+    fourth_ring: int = 0
 
     def __repr__(self) -> str:
         rings = "".join(chr(r + 65) for r in self.ring_settings)
         pos = "".join(chr(p + 65) for p in self.positions)
         plug = " ".join(f"{a}{b}" for a, b in self.plugboard_pairs)
-        return (
-            f"AttackResult(score={self.score:.3f}, "
-            f"rotors={'-'.join(self.rotor_names)}, "
-            f"reflector={self.reflector_name}, pos={pos}, rings={rings}, "
-            f"plugboard={plug or 'none'})\n  plaintext={self.plaintext!r}"
-        )
+        parts = [
+            f"AttackResult(score={self.score:.3f}",
+            f"rotors={'-'.join(self.rotor_names)}",
+            f"reflector={self.reflector_name}",
+            f"pos={pos}",
+            f"rings={rings}",
+        ]
+        if self.fourth_rotor_name:
+            parts.append(f"4th={self.fourth_rotor_name}({chr(self.fourth_position+65)})")
+        parts.append(f"plugboard={plug or 'none'})")
+        return ", ".join(parts) + f"\n  plaintext={self.plaintext!r}"
 
 
-def _decrypt_with_machine(
-    machine: Enigma, ciphertext: Sequence[int]
-) -> list[int]:
-    out: list[int] = []
-    for c in ciphertext:
-        out.append(machine.encrypt_letter(c))
-    return out
-
-
-def _early_reject(
-    plaintext: list[int],
-    candidates: list[set[int]],
-    model: LanguageModel,
-) -> bool:
-    """Return True if the partial plaintext violates a hard constraint."""
-    for t, p in enumerate(plaintext):
-        if p not in candidates[t]:
-            return True
-        if t > 0 and model.excluded[plaintext[t - 1]][p]:
-            return True
-    return False
-
-
-def _try_trajectory(
-    ciphertext: Sequence[int],
+def _try_fast(
+    cipher: list[int],
     candidates: list[set[int]],
     model: LanguageModel,
     rotor_names: tuple[str, str, str],
@@ -129,39 +115,80 @@ def _try_trajectory(
     positions: tuple[int, int, int],
     ring_settings: tuple[int, int, int],
     early_prefix: int,
-    ic_min: float = 0.45,
+    ic_min: float,
+    fourth_rotor_name: str | None = None,
+    fourth_position: int = 0,
+    fourth_ring: int = 0,
 ) -> tuple[float, list[int]] | None:
-    machine = Enigma(
-        rotor_names=rotor_names,
-        reflector_name=reflector_name,
-        positions=list(positions),
-        ring_settings=list(ring_settings),
-        plugboard=Plugboard.identity(),
-    )
-    # Short pre-check: decrypt the prefix; reject if any hard violation.
-    prefix: list[int] = []
-    cipher_list = list(ciphertext)
-    n_prefix = min(early_prefix, len(cipher_list))
-    for t in range(n_prefix):
-        p = machine.encrypt_letter(cipher_list[t])
-        if p not in candidates[t]:
-            return None
-        if t > 0 and model.excluded[prefix[t - 1]][p]:
-            return None
-        prefix.append(p)
-    # Continue full decryption from current state.
-    full = list(prefix)
-    for t in range(n_prefix, len(cipher_list)):
-        p = machine.encrypt_letter(cipher_list[t])
-        if model.excluded[full[-1]][p] if full else False:
+    """Core trial: decrypt letter-by-letter using inline stepping, reject on
+    the first hard constraint violation.
+
+    Uses fast inline rotor logic (no Python object cloning) with the same
+    early termination as before: reject as soon as the decrypted prefix
+    has an exclusory bigram or a candidate-set violation.
+    """
+    L = len(cipher)
+    left = ROTORS[rotor_names[0]]
+    middle = ROTORS[rotor_names[1]]
+    right = ROTORS[rotor_names[2]]
+    refl = REFLECTORS[reflector_name]
+
+    Lw, Le = left.wiring, left.inverse
+    Mw, Me = middle.wiring, middle.inverse
+    Rw, Re = right.wiring, right.inverse
+    Rf: tuple[int, ...] | list[int] = refl.wiring
+    right_notches = right.notches
+    middle_notches = middle.notches
+
+    if fourth_rotor_name is not None:
+        fourth = ROTORS[fourth_rotor_name]
+        o4 = (fourth_position - fourth_ring) % 26
+        combined = [0] * 26
+        for x in range(26):
+            s = (fourth.wiring[(x + o4) % 26] - o4) % 26
+            s = Rf[s]
+            s = (fourth.inverse[(s + o4) % 26] - o4) % 26
+            combined[x] = s
+        Rf = combined
+
+    pL, pM, pR = positions
+    rL, rM, rR = ring_settings
+    excluded = model.excluded
+    n_prefix = min(early_prefix, L)
+    full: list[int] = []
+
+    for t in range(L):
+        # Step
+        if pM in middle_notches:
+            pL = (pL + 1) % 26
+            pM = (pM + 1) % 26
+        elif pR in right_notches:
+            pM = (pM + 1) % 26
+        pR = (pR + 1) % 26
+
+        # Decrypt single letter: E_t(c_t) = p_t (involution property).
+        oL = (pL - rL) % 26
+        oM = (pM - rM) % 26
+        oR = (pR - rR) % 26
+        x = cipher[t]
+        s = (Rw[(x + oR) % 26] - oR) % 26
+        s = (Mw[(s + oM) % 26] - oM) % 26
+        s = (Lw[(s + oL) % 26] - oL) % 26
+        s = Rf[s]
+        s = (Le[(s + oL) % 26] - oL) % 26
+        s = (Me[(s + oM) % 26] - oM) % 26
+        p = (Re[(s + oR) % 26] - oR) % 26
+
+        # Early reject during prefix.
+        if t < n_prefix:
+            if p not in candidates[t]:
+                return None
+        if full and excluded[full[-1]][p]:
             return None
         full.append(p)
-    # IC pre-filter: candidate plaintext must have IC close to German. Even
-    # with an unknown plugboard the plaintext frequency distribution should
-    # be German-like (plugboard swaps preserve the multiset of letters up
-    # to a permutation that doesn't change IC). Reject obvious noise here
-    # cheaply before the heavier trigram scoring step.
-    if len(full) >= 8 and model.ic_score(full) < ic_min:
+
+    # IC pre-filter.
+    if L >= 8 and model.ic_score(full) < ic_min:
         return None
     score = model.score(full)
     if score == float("-inf"):
@@ -179,22 +206,17 @@ def infer_plugboard(
     max_pairs: int = 10,
     min_gain: float = 0.05,
 ) -> tuple[list[tuple[int, int]], list[int]]:
-    """Greedy swap inference. Returns (pairs, improved_plaintext).
+    """Greedy swap inference per the doc's Phase 4.
 
-    Requires each accepted swap to improve the per-character score by at
-    least ``min_gain`` log-units. This avoids fitting noise when the true
-    plugboard is identity or near-identity.
+    Requires each swap to clear ``min_gain`` log-units of improvement,
+    preventing spurious fitting when true plugboard is near-identity.
     """
     text = list(plaintext)
     pairs: list[tuple[int, int]] = []
     used: set[int] = set()
-
-    def score(t: list[int]) -> float:
-        return model.score(t)
-
-    current = score(text)
+    current = model.score(text)
     for _ in range(max_pairs):
-        best_gain = min_gain  # threshold; only swaps that clear this win
+        best_gain = min_gain
         best_pair: tuple[int, int] | None = None
         best_text: list[int] | None = None
         for a in range(26):
@@ -204,7 +226,7 @@ def infer_plugboard(
                 if b in used:
                     continue
                 swapped = [b if x == a else a if x == b else x for x in text]
-                s = score(swapped)
+                s = model.score(swapped)
                 gain = s - current
                 if gain > best_gain:
                     best_gain = gain
@@ -228,18 +250,29 @@ def attack(
     ciphertext: str,
     *,
     model: LanguageModel | None = None,
-    rotor_pool: Sequence[str] = ("I", "II", "III", "IV", "V"),
-    reflector_names: Sequence[str] = ("A", "B", "C"),
-    rings: Sequence[tuple[int, int, int]] = ((0, 0, 0),),
+    rotor_pool: Sequence[str] = M3_ROTORS,
+    reflector_names: Sequence[str] = M3_REFLECTORS,
+    rings: Sequence[tuple[int, int, int]] | None = None,
+    search_rings: bool = False,
     early_prefix: int = 10,
+    ic_min: float = 0.45,
     top_k: int = 5,
     progress: bool = False,
+    # M4 support:
+    fourth_rotors: Sequence[str] | None = None,
+    fourth_positions: Sequence[int] | None = None,
+    fourth_rings: Sequence[int] | None = None,
 ) -> list[AttackResult]:
     """Run GCP attack on the given ciphertext.
 
-    This is intentionally a focused, programmable search. To keep runtime
-    bounded for unit tests, callers can restrict the rotor pool, reflector
-    list, and ring settings. The pure-language pre-pruning still applies.
+    M3 mode (default): three rotors chosen from ``rotor_pool``, reflectors
+    from ``reflector_names``.
+
+    M4 mode: set ``fourth_rotors`` to ("Beta", "Gamma") and
+    ``reflector_names`` to ("B-thin", "C-thin").
+
+    Ring search: set ``search_rings=True`` to enumerate all 26*26 ring
+    settings for the middle and right rotors (left ring rarely matters).
     """
     if model is None:
         model = LanguageModel.german_military()
@@ -253,6 +286,24 @@ def attack(
     candidates = initialize_candidates(cipher)
     candidates = propagate_bigrams(candidates, model)
 
+    # Build ring list.
+    if rings is None:
+        if search_rings:
+            rings = [(0, rm, rr) for rm in range(26) for rr in range(26)]
+        else:
+            rings = [(0, 0, 0)]
+
+    # Fourth rotor config (M4) — default to no fourth rotor.
+    fourth_iter: list[tuple[str | None, int, int]] = [(None, 0, 0)]
+    if fourth_rotors:
+        fourth_iter = []
+        f_pos = fourth_positions if fourth_positions else range(26)
+        f_rings = fourth_rings if fourth_rings else [0]
+        for fr in fourth_rotors:
+            for fp in f_pos:
+                for fring in f_rings:
+                    fourth_iter.append((fr, fp, fring))
+
     best: list[AttackResult] = []
 
     def consider(res: AttackResult) -> None:
@@ -260,48 +311,54 @@ def attack(
         best.sort(key=lambda r: r.score, reverse=True)
         del best[top_k:]
 
-    # Phase 3
     tried = 0
     for refl in reflector_names:
         for rotor_triple in itertools.permutations(rotor_pool, 3):
             for ring in rings:
-                for pl in range(26):
-                    for pm in range(26):
-                        for pr in range(26):
-                            tried += 1
-                            res = _try_trajectory(
-                                cipher,
-                                candidates,
-                                model,
-                                rotor_triple,
-                                refl,
-                                (pl, pm, pr),
-                                ring,
-                                early_prefix,
-                            )
-                            if res is None:
-                                continue
-                            score, plaintext = res
-                            # Optional plugboard inference for top candidates.
-                            consider(
-                                AttackResult(
-                                    plaintext="".join(
-                                        chr(p + 65) for p in plaintext
-                                    ),
-                                    score=score,
-                                    rotor_names=rotor_triple,
-                                    reflector_name=refl,
-                                    positions=(pl, pm, pr),
-                                    ring_settings=ring,
+                for (fourth_name, fourth_pos, fourth_rng) in fourth_iter:
+                    for pl in range(26):
+                        for pm in range(26):
+                            for pr in range(26):
+                                tried += 1
+                                res = _try_fast(
+                                    cipher,
+                                    candidates,
+                                    model,
+                                    rotor_triple,
+                                    refl,
+                                    (pl, pm, pr),
+                                    ring,
+                                    early_prefix,
+                                    ic_min,
+                                    fourth_rotor_name=fourth_name,
+                                    fourth_position=fourth_pos,
+                                    fourth_ring=fourth_rng,
                                 )
-                            )
+                                if res is None:
+                                    continue
+                                score, plaintext = res
+                                consider(
+                                    AttackResult(
+                                        plaintext="".join(
+                                            chr(p + 65) for p in plaintext
+                                        ),
+                                        score=score,
+                                        rotor_names=rotor_triple,
+                                        reflector_name=refl,
+                                        positions=(pl, pm, pr),
+                                        ring_settings=ring,
+                                        fourth_rotor_name=fourth_name,
+                                        fourth_position=fourth_pos,
+                                        fourth_ring=fourth_rng,
+                                    )
+                                )
                 if progress:
                     print(
-                        f"  reflector={refl} rotors={rotor_triple} ring={ring} "
-                        f"tried={tried} best_score={best[0].score if best else float('-inf'):.3f}"
+                        f"  refl={refl} rotors={rotor_triple} ring={ring} "
+                        f"tried={tried} best={best[0].score if best else float('-inf'):.3f}"
                     )
 
-    # Refine top candidates with plugboard inference.
+    # Phase 4: Plugboard inference on top candidates.
     refined: list[AttackResult] = []
     for r in best:
         pt_ints = [ord(c) - 65 for c in r.plaintext]
@@ -320,6 +377,9 @@ def attack(
                         plugboard_pairs=[
                             (chr(a + 65), chr(b + 65)) for a, b in pairs
                         ],
+                        fourth_rotor_name=r.fourth_rotor_name,
+                        fourth_position=r.fourth_position,
+                        fourth_ring=r.fourth_ring,
                     )
                 )
                 continue

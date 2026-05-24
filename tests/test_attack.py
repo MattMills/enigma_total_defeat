@@ -74,6 +74,45 @@ def test_attack_recovers_with_real_plugboard():
 
 
 @pytest.mark.slow
+def test_attack_m4_recovers_key():
+    """M4: encrypt with Beta + B-thin, recover key from ciphertext."""
+    plaintext = "DASWETTERISTHEUTESEHRGUTSTOPENDE"
+    cfg = dict(
+        rotor_names=("I", "II", "III"),
+        reflector_name="B-thin",
+        positions=[7, 11, 19],
+        ring_settings=[0, 0, 0],
+        fourth_rotor_name="Beta",
+        fourth_position=5,
+        fourth_ring=0,
+    )
+    enc = Enigma(**cfg)
+    ciphertext = enc.encrypt(plaintext)
+
+    results = attack(
+        ciphertext,
+        rotor_pool=("I", "II", "III"),
+        reflector_names=("B-thin",),
+        rings=((0, 0, 0),),
+        fourth_rotors=("Beta",),
+        fourth_positions=[5],
+        fourth_rings=[0],
+        top_k=10,
+        early_prefix=8,
+    )
+    assert results, "M4 attack returned no candidates"
+    matched = [
+        r for r in results
+        if r.rotor_names == ("I", "II", "III")
+        and r.reflector_name == "B-thin"
+        and tuple(r.positions) == (7, 11, 19)
+        and r.fourth_rotor_name == "Beta"
+        and r.fourth_position == 5
+    ]
+    assert matched, "M4 correct key not found"
+
+
+@pytest.mark.slow
 def test_attack_recovers_short_message_end_to_end():
     """End-to-end: from ciphertext alone, recover key AND plaintext."""
     plaintext = "DASWETTERISTHEUTESEHRGUTSTOPENDE"
