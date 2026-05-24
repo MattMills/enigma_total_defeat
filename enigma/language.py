@@ -28,8 +28,8 @@ EXCLUSORY_BIGRAMS: frozenset[str] = frozenset({
     "QX", "QY", "QJ", "QK", "QV", "QW", "QZ",
     "JQ", "JX", "JZ",
     "XJ", "XQ",
-    "YQ", "YX", "YJ",
-    "ZX", "ZQ",
+    "YQ", "YJ",
+    "ZQ",
 })
 
 
