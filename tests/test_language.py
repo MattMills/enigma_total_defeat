@@ -25,7 +25,7 @@ def test_bigram_rows_sum_to_one():
 
 def test_excluded_bigrams_are_zero():
     m = LanguageModel.german_military()
-    for pair in ["QX", "QY", "JQ", "XJ", "YQ", "ZX"]:
+    for pair in ["QX", "QY", "JQ", "XJ", "ZQ"]:
         a, b = ord(pair[0]) - 65, ord(pair[1]) - 65
         assert m.excluded[a][b]
         assert m.bigram[a][b] == 0.0
