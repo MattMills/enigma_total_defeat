@@ -16,6 +16,13 @@ from enigma.simulator import (
 )
 from enigma.language import LanguageModel
 from enigma.attack import attack, AttackResult
+from enigma.solver import (
+    PlugboardSolver,
+    SolverResult,
+    progressive_solve,
+    crt,
+    crt_multi,
+)
 
 __all__ = [
     "Enigma",
@@ -33,4 +40,9 @@ __all__ = [
     "LanguageModel",
     "attack",
     "AttackResult",
+    "PlugboardSolver",
+    "SolverResult",
+    "progressive_solve",
+    "crt",
+    "crt_multi",
 ]
