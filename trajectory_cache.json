@@ -1,0 +1,187 @@
+{
+  "cache_size": 7,
+  "rotor_triples_seen": [
+    "I-II-III/B",
+    "II-IV-V/B",
+    "II-IV-V/B-thin",
+    "II-I-III/A",
+    "III-VI-VIII/B"
+  ],
+  "entries": [
+    {
+      "fingerprint": "21267cbfa59e0c43",
+      "rotors": [
+        "I",
+        "II",
+        "III"
+      ],
+      "reflector": "B",
+      "positions": [
+        "A",
+        "A",
+        "A"
+      ],
+      "rings": [
+        "A",
+        "A",
+        "A"
+      ],
+      "fourth_rotor": null,
+      "fourth_position": null,
+      "message_ids": [
+        "bombe-test-1"
+      ],
+      "trajectory_length": 5
+    },
+    {
+      "fingerprint": "43538d3694d9210b",
+      "rotors": [
+        "II",
+        "IV",
+        "V"
+      ],
+      "reflector": "B",
+      "positions": [
+        "B",
+        "L",
+        "A"
+      ],
+      "rings": [
+        "B",
+        "U",
+        "L"
+      ],
+      "fourth_rotor": null,
+      "fourth_position": null,
+      "message_ids": [
+        "barbarossa-1"
+      ],
+      "trajectory_length": 174
+    },
+    {
+      "fingerprint": "bd81a3e7087297a2",
+      "rotors": [
+        "II",
+        "IV",
+        "V"
+      ],
+      "reflector": "B",
+      "positions": [
+        "L",
+        "S",
+        "D"
+      ],
+      "rings": [
+        "B",
+        "U",
+        "L"
+      ],
+      "fourth_rotor": null,
+      "fourth_position": null,
+      "message_ids": [
+        "barbarossa-2"
+      ],
+      "trajectory_length": 135
+    },
+    {
+      "fingerprint": "0b25c47e4e03dae4",
+      "rotors": [
+        "II",
+        "IV",
+        "V"
+      ],
+      "reflector": "B-thin",
+      "positions": [
+        "J",
+        "N",
+        "A"
+      ],
+      "rings": [
+        "A",
+        "A",
+        "V"
+      ],
+      "fourth_rotor": "Beta",
+      "fourth_position": "V",
+      "message_ids": [
+        "m4-project-scharnhorst"
+      ],
+      "trajectory_length": 232
+    },
+    {
+      "fingerprint": "cbf5ae76ce9eec19",
+      "rotors": [
+        "II",
+        "I",
+        "III"
+      ],
+      "reflector": "A",
+      "positions": [
+        "A",
+        "B",
+        "L"
+      ],
+      "rings": [
+        "X",
+        "M",
+        "V"
+      ],
+      "fourth_rotor": null,
+      "fourth_position": null,
+      "message_ids": [
+        "instruction-manual-1930"
+      ],
+      "trajectory_length": 87
+    },
+    {
+      "fingerprint": "d69a669dc59e34f8",
+      "rotors": [
+        "II",
+        "IV",
+        "V"
+      ],
+      "reflector": "B-thin",
+      "positions": [
+        "V",
+        "J",
+        "A"
+      ],
+      "rings": [
+        "A",
+        "A",
+        "A"
+      ],
+      "fourth_rotor": "Beta",
+      "fourth_position": "A",
+      "message_ids": [
+        "m4-project-donitz"
+      ],
+      "trajectory_length": 200
+    },
+    {
+      "fingerprint": "fc1bc550bd4e080a",
+      "rotors": [
+        "III",
+        "VI",
+        "VIII"
+      ],
+      "reflector": "B",
+      "positions": [
+        "U",
+        "Z",
+        "V"
+      ],
+      "rings": [
+        "A",
+        "H",
+        "M"
+      ],
+      "fourth_rotor": null,
+      "fourth_position": null,
+      "message_ids": [
+        "scharnhorst-last-1943"
+      ],
+      "trajectory_length": 80
+    }
+  ]
+}
