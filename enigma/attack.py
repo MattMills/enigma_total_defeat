@@ -21,7 +21,13 @@ import itertools
 from dataclasses import dataclass, field
 from typing import Iterable, Sequence
 
-from enigma.language import LanguageModel, UNIGRAM_FREQ
+from enigma.language import (
+    GERMAN_IC,
+    RANDOM_IC,
+    LanguageModel,
+    UNIGRAM_FREQ,
+    index_of_coincidence,
+)
 from enigma.simulator import (
     Enigma,
     Plugboard,
@@ -123,6 +129,7 @@ def _try_trajectory(
     positions: tuple[int, int, int],
     ring_settings: tuple[int, int, int],
     early_prefix: int,
+    ic_min: float = 0.45,
 ) -> tuple[float, list[int]] | None:
     machine = Enigma(
         rotor_names=rotor_names,
@@ -149,6 +156,13 @@ def _try_trajectory(
         if model.excluded[full[-1]][p] if full else False:
             return None
         full.append(p)
+    # IC pre-filter: candidate plaintext must have IC close to German. Even
+    # with an unknown plugboard the plaintext frequency distribution should
+    # be German-like (plugboard swaps preserve the multiset of letters up
+    # to a permutation that doesn't change IC). Reject obvious noise here
+    # cheaply before the heavier trigram scoring step.
+    if len(full) >= 8 and model.ic_score(full) < ic_min:
+        return None
     score = model.score(full)
     if score == float("-inf"):
         return None
@@ -160,9 +174,17 @@ def _try_trajectory(
 
 
 def infer_plugboard(
-    plaintext: list[int], model: LanguageModel, max_pairs: int = 10
+    plaintext: list[int],
+    model: LanguageModel,
+    max_pairs: int = 10,
+    min_gain: float = 0.05,
 ) -> tuple[list[tuple[int, int]], list[int]]:
-    """Greedy swap inference. Returns (pairs, improved_plaintext)."""
+    """Greedy swap inference. Returns (pairs, improved_plaintext).
+
+    Requires each accepted swap to improve the per-character score by at
+    least ``min_gain`` log-units. This avoids fitting noise when the true
+    plugboard is identity or near-identity.
+    """
     text = list(plaintext)
     pairs: list[tuple[int, int]] = []
     used: set[int] = set()
@@ -172,7 +194,7 @@ def infer_plugboard(
 
     current = score(text)
     for _ in range(max_pairs):
-        best_gain = 0.0
+        best_gain = min_gain  # threshold; only swaps that clear this win
         best_pair: tuple[int, int] | None = None
         best_text: list[int] | None = None
         for a in range(26):

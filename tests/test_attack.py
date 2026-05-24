@@ -40,17 +40,42 @@ def test_propagate_bigrams_prunes_dead_ends():
 
 
 @pytest.mark.slow
-def test_attack_evaluates_correct_key_in_top_candidates():
-    """End-to-end: encrypt known German text, verify the correct key
-    survives to the top candidate pool.
+def test_attack_recovers_with_real_plugboard():
+    """Encrypt with an actual plugboard, verify key recovery + that the
+    inferred plugboard's effect makes the plaintext substantially more
+    German-like than the no-plugboard decryption."""
+    plaintext = "DASWETTERISTHEUTESEHRGUTSTOPDIETRUPPEISTBEREIT"
+    plug = Plugboard.from_pairs(["AB", "CD", "EF"])
+    cfg = dict(
+        rotor_names=("I", "II", "III"),
+        reflector_name="B",
+        positions=[7, 11, 19],
+        ring_settings=[0, 0, 0],
+    )
+    enc = Enigma(plugboard=Plugboard(mapping=list(plug.mapping)), **cfg)
+    ciphertext = enc.encrypt(plaintext)
 
-    Note: the bundled approximate bigram model is not sufficient to
-    *uniquely* rank the true plaintext above all gibberish on short
-    messages; the doc itself anticipates this and requires either a
-    stronger (trigram / word-based) model or longer text for unique
-    ranking. We assert the weaker property that the correct rotor
-    settings are among the top-K results.
-    """
+    results = attack(
+        ciphertext,
+        rotor_pool=("I", "II", "III"),
+        reflector_names=("B",),
+        rings=((0, 0, 0),),
+        top_k=20,
+        early_prefix=8,
+    )
+    assert results, "attack returned no candidates"
+    matched = [
+        r for r in results
+        if r.rotor_names == ("I", "II", "III")
+        and r.reflector_name == "B"
+        and tuple(r.positions) == (7, 11, 19)
+    ]
+    assert matched, "correct key not in top results with real plugboard"
+
+
+@pytest.mark.slow
+def test_attack_recovers_short_message_end_to_end():
+    """End-to-end: from ciphertext alone, recover key AND plaintext."""
     plaintext = "DASWETTERISTHEUTESEHRGUTSTOPENDE"
     cfg = dict(
         rotor_names=("I", "II", "III"),
@@ -66,20 +91,19 @@ def test_attack_evaluates_correct_key_in_top_candidates():
         rotor_pool=("I", "II", "III"),
         reflector_names=("B",),
         rings=((0, 0, 0),),
-        top_k=50,
+        top_k=10,
         early_prefix=8,
     )
     assert results, "attack returned no candidates"
-    matched = [
-        r for r in results
-        if r.rotor_names == ("I", "II", "III")
-        and r.reflector_name == "B"
-        and tuple(r.positions) == (7, 11, 19)
-    ]
-    assert matched, (
-        "correct key not in top results; "
-        f"best key={results[0].rotor_names}/{results[0].reflector_name}/"
-        f"{results[0].positions}"
+    top = results[0]
+    assert top.rotor_names == ("I", "II", "III")
+    assert top.reflector_name == "B"
+    assert tuple(top.positions) == (7, 11, 19)
+    assert top.plaintext == plaintext, (
+        f"plaintext mismatch: got {top.plaintext!r}, want {plaintext!r}"
+    )
+    assert not top.plugboard_pairs, (
+        f"spurious plugboard inferred: {top.plugboard_pairs}"
     )
 
 
