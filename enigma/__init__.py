@@ -15,7 +15,7 @@ from enigma.simulator import (
     fast_trajectory,
 )
 from enigma.language import LanguageModel
-from enigma.attack import attack, AttackResult
+from enigma.attack import attack, AttackResult, beam_swap_search
 from enigma.solver import (
     PlugboardSolver,
     SolverResult,
@@ -40,6 +40,7 @@ __all__ = [
     "LanguageModel",
     "attack",
     "AttackResult",
+    "beam_swap_search",
     "PlugboardSolver",
     "SolverResult",
     "progressive_solve",

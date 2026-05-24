@@ -576,3 +576,82 @@ def attack_with_plugboard(
 
     results.sort(key=lambda r: r.score, reverse=True)
     return results[:top_k]
+
+
+# ----------------------------------------------------------------------
+# Beam swap search (plugboard recovery from a known trajectory)
+# ----------------------------------------------------------------------
+
+
+def beam_swap_search(
+    cipher: list[int],
+    trajectory: list[list[int]],
+    model: LanguageModel,
+    start_plug: list[int] | None = None,
+    beam_width: int = 50,
+    rounds: int = 8,
+) -> tuple[float, list[int], list[int]]:
+    """Recover the plugboard for a known trajectory via beam search.
+
+    Maintains ``beam_width`` parallel plugboard hypotheses. Each round,
+    every hypothesis is expanded by trying all C(26,2)=325 swap moves
+    and all unpair moves. The top ``beam_width`` unique results survive.
+
+    A swap move on (a,b): disconnect a and b from their current partners,
+    connect a↔b. An unpair move: disconnect an existing pair.
+
+    Returns (score, plugboard_map, decrypted_ints).
+    """
+    def decrypt(pl: list[int]) -> list[int]:
+        return [pl[trajectory[t][pl[cipher[t]]]] for t in range(len(cipher))]
+
+    def apply_swap(plug: list[int], a: int, b: int) -> list[int]:
+        p = list(plug)
+        oa, ob = p[a], p[b]
+        if oa != a:
+            p[oa] = oa
+        if ob != b:
+            p[ob] = ob
+        p[a] = b
+        p[b] = a
+        return p
+
+    if start_plug is None:
+        start_plug = list(range(26))
+
+    beam: list[tuple[float, list[int]]] = [
+        (model.score(decrypt(start_plug)), list(start_plug))
+    ]
+
+    for _ in range(rounds):
+        candidates: list[tuple[float, list[int]]] = []
+        for _, plug in beam:
+            for a in range(26):
+                for b in range(a + 1, 26):
+                    np = apply_swap(plug, a, b)
+                    s = model.score(decrypt(np))
+                    candidates.append((s, np))
+            for a in range(26):
+                if plug[a] > a:
+                    np = list(plug)
+                    b = plug[a]
+                    np[a] = a
+                    np[b] = b
+                    s = model.score(decrypt(np))
+                    candidates.append((s, np))
+
+        candidates.sort(reverse=True)
+        seen: set[tuple[int, ...]] = set()
+        new_beam: list[tuple[float, list[int]]] = []
+        for s, p in candidates:
+            key = tuple(p)
+            if key not in seen and len(new_beam) < beam_width:
+                new_beam.append((s, p))
+                seen.add(key)
+        beam = new_beam
+
+        if not beam:
+            break
+
+    best_score, best_plug = beam[0]
+    return best_score, best_plug, decrypt(best_plug)

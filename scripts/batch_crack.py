@@ -24,9 +24,9 @@ from enigma.messages import (
     get_messages_with_known_solution,
     get_unsolved_messages,
 )
-from enigma.simulator import Enigma, Plugboard
-from enigma.language import LanguageModel
-from enigma.solver import progressive_solve
+from enigma.simulator import Enigma, Plugboard, fast_trajectory
+from enigma.language import LanguageModel, index_of_coincidence
+from enigma.attack import beam_swap_search
 
 
 @dataclass
@@ -98,36 +98,27 @@ def verify_message(msg: EnigmaMessage) -> bool | None:
 def attack_message(
     msg: EnigmaMessage,
     model: LanguageModel,
-    time_limit: float = 30.0,
+    time_limit: float = 10.0,
 ) -> CrackResult:
-    """Run the progressive solver on this message."""
+    """Attack a message: IC-filter positions, beam-swap plugboard search."""
     ct_clean = "".join(c for c in msg.ciphertext if "A" <= c <= "Z")
     if len(ct_clean) < 10:
         return CrackResult(
-            msg_id=msg.id,
-            status="skipped",
+            msg_id=msg.id, status="skipped",
             notes=f"ciphertext too short ({len(ct_clean)} chars)",
         )
 
-    # Determine search parameters based on machine type and known info.
-    if msg.rotors:
-        rotor_pool = tuple(msg.rotors)
-    elif msg.machine_type == MachineType.M4:
-        rotor_pool = ("I", "II", "III", "IV", "V", "VI", "VII", "VIII")
-    else:
-        rotor_pool = ("I", "II", "III", "IV", "V")
+    cipher = [ord(c) - 65 for c in ct_clean]
+    L = len(cipher)
 
-    if msg.reflector:
-        refls = (msg.reflector,)
-    elif msg.machine_type == MachineType.M4:
-        refls = ("B-thin", "C-thin")
-    else:
-        refls = ("A", "B", "C")
+    if not msg.rotors or not msg.reflector:
+        return CrackResult(
+            msg_id=msg.id, status="skipped", notes="no rotor/reflector info",
+        )
 
-    ring = (0, 0, 0)
-    if msg.ring_settings:
-        ring = tuple(_parse_positions(msg.ring_settings))
-
+    rotor_names = tuple(msg.rotors)
+    reflector = msg.reflector
+    rings = tuple(_parse_positions(msg.ring_settings)) if msg.ring_settings else (0, 0, 0)
     fourth_kw = {}
     if msg.fourth_rotor:
         fourth_kw["fourth_rotor_name"] = msg.fourth_rotor
@@ -137,63 +128,63 @@ def attack_message(
         fourth_kw["fourth_ring"] = 0
 
     t0 = time.time()
-    try:
-        results = progressive_solve(
-            ct_clean,
-            model=model,
-            rotor_pool=rotor_pool,
-            reflector_names=refls,
-            ring_settings=ring,
-            top_k=3,
-            **fourth_kw,
-        )
-    except Exception as e:
-        return CrackResult(
-            msg_id=msg.id,
-            status="failed",
-            notes=f"attack error: {e}",
-            elapsed=time.time() - t0,
-        )
+
+    # Phase 1: IC-filter positions
+    ic_scores = []
+    for pl in range(26):
+        for pm in range(26):
+            for pr in range(26):
+                traj = fast_trajectory(
+                    rotor_names, reflector, (pl, pm, pr), rings, L,
+                    **fourth_kw,
+                )
+                dec = [traj[t][cipher[t]] for t in range(L)]
+                ic_scores.append((index_of_coincidence(dec), (pl, pm, pr)))
+    ic_scores.sort(reverse=True)
+    survivors = [pos for _, pos in ic_scores[:200]]
+
+    # Phase 2: beam swap on top survivors (3 rounds keeps it fast)
+    best_score = float("-inf")
+    best_result = None
+    for pos in survivors:
+        if time.time() - t0 > time_limit:
+            break
+        traj = fast_trajectory(rotor_names, reflector, pos, rings, L, **fourth_kw)
+        score, plug, dec = beam_swap_search(cipher, traj, model, rounds=3)
+        if score > best_score:
+            best_score = score
+            best_result = (score, pos, plug, dec)
+
     elapsed = time.time() - t0
 
-    if not results:
-        return CrackResult(
-            msg_id=msg.id,
-            status="failed",
-            notes="no candidates found",
-            elapsed=elapsed,
-        )
+    if best_result is None:
+        return CrackResult(msg_id=msg.id, status="failed", elapsed=elapsed)
 
-    top = results[0]
+    score, pos, plug, dec = best_result
+    plaintext = "".join(chr(p + 65) for p in dec)
+    pairs = [(a, plug[a]) for a in range(26) if plug[a] > a]
+    key_str = (
+        f"rotors={'-'.join(rotor_names)} refl={reflector} "
+        f"pos={''.join(chr(p+65) for p in pos)} "
+        f"rings={''.join(chr(r+65) for r in rings)}"
+    )
+    if pairs:
+        key_str += f" plug={' '.join(chr(a+65)+chr(b+65) for a,b in pairs)}"
+
     known_clean = "".join(c for c in msg.known_plaintext.upper() if "A" <= c <= "Z")
-
-    if known_clean and top.plaintext == known_clean[:len(top.plaintext)]:
+    if known_clean and plaintext == known_clean[:len(plaintext)]:
         status = "cracked"
     elif known_clean:
-        match = sum(a == b for a, b in zip(top.plaintext, known_clean))
+        match = sum(a == b for a, b in zip(plaintext, known_clean))
         ratio = match / max(len(known_clean), 1)
-        if ratio > 0.7:
-            status = "partial"
-        else:
-            status = "failed"
+        status = "partial" if ratio > 0.5 else "failed"
     else:
-        status = "cracked" if top.score > -2.5 else "partial"
-
-    key_str = (
-        f"rotors={'-'.join(top.rotor_names)} refl={top.reflector_name} "
-        f"pos={''.join(chr(p+65) for p in top.positions)} "
-        f"rings={''.join(chr(r+65) for r in top.ring_settings)}"
-    )
-    if top.plugboard_pairs:
-        key_str += f" plug={' '.join(a+b for a,b in top.plugboard_pairs)}"
+        status = "cracked" if score > -3.1 else "partial"
 
     return CrackResult(
-        msg_id=msg.id,
-        status=status,
-        attack_plaintext=top.plaintext[:80],
-        attack_score=top.score,
-        attack_key=key_str,
-        elapsed=elapsed,
+        msg_id=msg.id, status=status,
+        attack_plaintext=plaintext[:80], attack_score=score,
+        attack_key=key_str, elapsed=elapsed,
     )
 
 

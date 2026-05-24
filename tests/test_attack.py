@@ -18,6 +18,8 @@ from enigma.attack import (
 from enigma.language import LanguageModel
 from enigma.simulator import Enigma, Plugboard
 
+model = LanguageModel.german_military()
+
 
 def test_initialize_candidates_excludes_ciphertext_letter():
     cipher = [0, 1, 2]  # A, B, C
@@ -144,6 +146,29 @@ def test_attack_recovers_short_message_end_to_end():
     assert not top.plugboard_pairs, (
         f"spurious plugboard inferred: {top.plugboard_pairs}"
     )
+
+
+@pytest.mark.slow
+def test_beam_swap_recovers_plugboard():
+    """Beam swap search recovers a 3-pair plugboard from correct trajectory."""
+    plaintext = "DASWETTERISTHEUTESEHRGUTUNDDIEMASCHINEFUNKTIONIERT"
+    plug = Plugboard.from_pairs(["AB", "CD", "EF"])
+    cfg = dict(
+        rotor_names=("I", "II", "III"),
+        reflector_name="B",
+        positions=[7, 11, 19],
+        ring_settings=[0, 0, 0],
+    )
+    from enigma.simulator import fast_trajectory
+    enc = Enigma(plugboard=Plugboard(mapping=list(plug.mapping)), **cfg)
+    ciphertext = enc.encrypt(plaintext)
+    cipher = [ord(c) - 65 for c in ciphertext]
+    traj = fast_trajectory(("I", "II", "III"), "B", (7, 11, 19), (0, 0, 0), len(cipher))
+
+    from enigma.attack import beam_swap_search
+    score, found_plug, dec = beam_swap_search(cipher, traj, model, rounds=5)
+    found_text = "".join(chr(p + 65) for p in dec)
+    assert found_text == plaintext, f"got {found_text[:30]}"
 
 
 def test_infer_plugboard_improves_score_on_swapped_text():
