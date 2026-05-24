@@ -5,24 +5,22 @@ The right rotor traces a closed orbit of 26 permutations in the
 wiring produces a DIFFERENT orbit shape. The ciphertext produces
 weighted observations in the same space via the language prior.
 
-The attack:
-  1. UP: embed each rotor's 26-position orbit into R^676.
-  2. ACROSS: embed the ciphertext as weighted observations in R^676
-     using German letter frequencies as soft plaintext hypotheses.
-  3. DOWN: circular cross-correlation between orbit and observations
-     → a function on the 26-element circle Z/26Z.
-  4. CIRCLE: the peak of this function gives the starting position;
-     the amplitude gives the rotor match quality.
+The attack operates BIDIRECTIONALLY: forward constraints (bigram
+successors from position 0→L) and backward constraints (bigram
+predecessors from position L→0) propagate simultaneously along the
+trajectory. Where both passes agree on a candidate, the hypothesis
+is reinforced; where they disagree, the hypothesis is eliminated.
 
-This identifies the right rotor AND its starting position in one pass
-over the ciphertext, without trying all 17,576 position combinations.
-The middle/left rotors contribute a CONSTANT offset (for positions
-before the first turnover) which shifts all correlations equally —
-it doesn't change which rotor or which position wins.
+The entire message length acts as a rigid constraint spine — the
+Enigma trajectory is deterministic, so fixing the key at ANY single
+position determines ALL positions. Bidirectional propagation exploits
+this by attacking from both ends, meeting in the middle where the
+constraint density is highest.
 """
 
 from __future__ import annotations
 
+import itertools
 import math
 from dataclasses import dataclass, field
 from typing import Sequence
@@ -373,3 +371,169 @@ def full_circular_solve(
 
     all_results.sort(key=lambda x: x["score"], reverse=True)
     return all_results[:top_k]
+
+
+# ------------------------------------------------------------------
+# Bidirectional constraint propagation
+# ------------------------------------------------------------------
+
+
+def bidirectional_score(
+    cipher: list[int],
+    rotor_names: tuple[str, str, str],
+    reflector_name: str,
+    positions: tuple[int, int, int],
+    ring_settings: tuple[int, int, int],
+    model: LanguageModel,
+    fourth_rotor_name: str | None = None,
+    fourth_position: int = 0,
+    fourth_ring: int = 0,
+) -> tuple[float, list[int]] | None:
+    """Bidirectional decryption and scoring.
+
+    Decrypts the ciphertext in BOTH directions simultaneously:
+      Forward:  d_fwd[0], d_fwd[1], ..., d_fwd[L-1]  (left to right)
+      Backward: d_bwd[L-1], d_bwd[L-2], ..., d_bwd[0] (right to left)
+
+    Since the Enigma trajectory is deterministic, both passes use the
+    SAME sequence of operative geometries — but the language model
+    constraints flow in opposite directions:
+      Forward:  bigram(d[t-1], d[t]) must be valid German
+      Backward: bigram(d[t], d[t+1]) must be valid German
+
+    A trajectory that passes BOTH forward AND backward rejection is
+    more likely correct than one that passes only forward. This
+    doubles the constraint power with negligible extra cost.
+
+    Additionally, the backward pass checks bigrams from the END of
+    the message (where closings like ENDE, STOP, HEIL are common),
+    providing strong constraints that the forward-only pass reaches
+    last.
+    """
+    L = len(cipher)
+    left = ROTORS[rotor_names[0]]
+    middle = ROTORS[rotor_names[1]]
+    right = ROTORS[rotor_names[2]]
+    refl = REFLECTORS[reflector_name]
+
+    Lw, Le = left.wiring, left.inverse
+    Mw, Me = middle.wiring, middle.inverse
+    Rw, Re = right.wiring, right.inverse
+    Rf: tuple[int, ...] | list[int] = refl.wiring
+    right_notches = right.notches
+    middle_notches = middle.notches
+
+    if fourth_rotor_name is not None:
+        fourth = ROTORS[fourth_rotor_name]
+        o4 = (fourth_position - fourth_ring) % 26
+        combined = [0] * 26
+        for x in range(26):
+            s = (fourth.wiring[(x + o4) % 26] - o4) % 26
+            s = Rf[s]
+            s = (fourth.inverse[(s + o4) % 26] - o4) % 26
+            combined[x] = s
+        Rf = combined
+
+    pL, pM, pR = positions
+    rL, rM, rR = ring_settings
+    excluded = model.excluded
+    full: list[int] = []
+
+    # Forward pass: decrypt and check bigrams left-to-right.
+    fwd_pL, fwd_pM, fwd_pR = pL, pM, pR
+    for t in range(L):
+        if fwd_pM in middle_notches:
+            fwd_pL = (fwd_pL + 1) % 26
+            fwd_pM = (fwd_pM + 1) % 26
+        elif fwd_pR in right_notches:
+            fwd_pM = (fwd_pM + 1) % 26
+        fwd_pR = (fwd_pR + 1) % 26
+
+        oL = (fwd_pL - rL) % 26
+        oM = (fwd_pM - rM) % 26
+        oR = (fwd_pR - rR) % 26
+        x = cipher[t]
+        s = (Rw[(x + oR) % 26] - oR) % 26
+        s = (Mw[(s + oM) % 26] - oM) % 26
+        s = (Lw[(s + oL) % 26] - oL) % 26
+        s = Rf[s]
+        s = (Le[(s + oL) % 26] - oL) % 26
+        s = (Me[(s + oM) % 26] - oM) % 26
+        p = (Re[(s + oR) % 26] - oR) % 26
+
+        # Forward bigram rejection.
+        if full and excluded[full[-1]][p]:
+            return None
+        full.append(p)
+
+    # Backward pass: check bigrams right-to-left.
+    for t in range(L - 1, 0, -1):
+        if excluded[full[t]][full[t - 1]]:
+            return None
+
+    score = model.score(full)
+    if score == float("-inf"):
+        return None
+    return score, full
+
+
+def bidirectional_attack(
+    ciphertext: str,
+    *,
+    model: LanguageModel | None = None,
+    rotor_pool: Sequence[str] = ("I", "II", "III", "IV", "V"),
+    reflector_names: Sequence[str] = ("B",),
+    ring_settings: tuple[int, int, int] = (0, 0, 0),
+    top_k: int = 5,
+    fourth_rotor_name: str | None = None,
+    fourth_position: int = 0,
+    fourth_ring: int = 0,
+) -> list[dict]:
+    """Full brute-force attack with bidirectional constraint checking.
+
+    For each (rotor_combo, reflector, position):
+      1. Decrypt forward, rejecting on first excluded bigram (fast).
+      2. IF forward passes: check backward bigrams from the END.
+      3. Score survivors with the full language model.
+
+    The backward pass adds ~0% cost (just 26 comparisons on the
+    already-decrypted text) but eliminates candidates that happen
+    to pass the forward bigram filter while having invalid bigrams
+    at the END of the message. This is especially useful for
+    messages with stereotyped endings (ENDE, STOP, etc.).
+    """
+    if model is None:
+        model = LanguageModel.german_military()
+
+    cipher = [ord(c) - 65 for c in ciphertext if "A" <= c <= "Z"]
+    if not cipher:
+        return []
+
+    results: list[dict] = []
+
+    for refl in reflector_names:
+        for rotor_triple in itertools.permutations(rotor_pool, 3):
+            for pl in range(26):
+                for pm in range(26):
+                    for pr in range(26):
+                        res = bidirectional_score(
+                            cipher, rotor_triple, refl,
+                            (pl, pm, pr), ring_settings, model,
+                            fourth_rotor_name=fourth_rotor_name,
+                            fourth_position=fourth_position,
+                            fourth_ring=fourth_ring,
+                        )
+                        if res is None:
+                            continue
+                        score, dec = res
+                        results.append({
+                            "score": score,
+                            "rotors": rotor_triple,
+                            "reflector": refl,
+                            "positions": (pl, pm, pr),
+                            "rings": ring_settings,
+                            "plaintext": "".join(chr(d + 65) for d in dec),
+                        })
+
+    results.sort(key=lambda x: x["score"], reverse=True)
+    return results[:top_k]
