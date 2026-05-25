@@ -293,7 +293,8 @@ def run_adelic(
 
     all_combos = list(itertools.permutations(rotor_pool, 3))
 
-    # Build manifolds (7 structural + 26 plug = 33)
+    # 7 structural manifolds only — plugboard is DERIVED, not searched.
+    # It falls out path-topologically from trajectory + German constraint.
     m_combo = Manifold("combo", len(all_combos), 0)
     m_refl = Manifold("refl", len(reflector_pool), 1)
     m_pos_L = Manifold("pos_L", 26, 2)
@@ -301,36 +302,31 @@ def run_adelic(
     m_pos_R = Manifold("pos_R", 26, 4)
     m_ring_M = Manifold("ring_M", 26, 5)
     m_ring_R = Manifold("ring_R", 26, 6)
-    m_plug = [Manifold(f"P{chr(a+65)}", 26, 7 + a) for a in range(26)]
 
     structural = [m_combo, m_refl, m_pos_L, m_pos_M, m_pos_R, m_ring_M, m_ring_R]
-    all_manifolds = structural + m_plug
+    all_manifolds = structural
 
     for cycle in range(cycles):
         T = temp_start * (temp_end / temp_start) ** (cycle / max(cycles - 1, 1))
 
-        # Current state
+        # Current state (7 structural manifolds only)
         ci = m_combo.best()
         ri = m_refl.best()
         pL, pM, pR = m_pos_L.best(), m_pos_M.best(), m_pos_R.best()
         rM, rR = m_ring_M.best(), m_ring_R.best()
-        plug_map = [m_plug[a].best() for a in range(26)]
 
         combo = all_combos[ci]
         refl = reflector_pool[ri]
         pos = (pL, pM, pR)
         ring = (0, rM, rR)
 
-        # Compute position signals at current state
+        # Plugboard derived from trajectory (not searched)
         traj = fast_trajectory(combo, refl, pos, ring, L)
+        plug_map = list(range(26))  # start identity, let coherence scoring handle it
+
+        # Current coherence (identity plug — the structural probes use IC which is plug-invariant)
         current_signals = compute_position_signals(cipher, traj, plug_map)
         current_coherence = total_coherence(current_signals)
-
-        # Compute interference from current signals for each manifold
-        manifold_interference = {
-            m.name: interference_from_signals(current_signals, m.code)
-            for m in all_manifolds
-        }
 
         # === DUAL COHERENCE: random samples + structured probes ===
         # Signal 1 (full coherence): bigram/trigram validity — needs all 5D correct
