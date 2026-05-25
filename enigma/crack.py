@@ -18,6 +18,19 @@ Wrong plugboard → 1-5 excluded bigrams → state dies.
 from __future__ import annotations
 
 from enigma.language import LanguageModel
+from enigma.ngram_data import BIGRAMS_OBSERVED, TRIGRAMS_OBSERVED, QUADGRAMS_OBSERVED
+
+
+def _bg_valid(a: int, b: int) -> bool:
+    return (a * 26 + b) in BIGRAMS_OBSERVED
+
+
+def _tg_valid(a: int, b: int, c: int) -> bool:
+    return (a * 676 + b * 26 + c) in TRIGRAMS_OBSERVED
+
+
+def _qg_valid(a: int, b: int, c: int, d: int) -> bool:
+    return (a * 17576 + b * 676 + c * 26 + d) in QUADGRAMS_OBSERVED
 
 
 class DomainPlug:
@@ -205,14 +218,54 @@ def _cascade(
             if dp.dead():
                 return False
 
-        # PER-POSITION: narrow domain(c_t) via cipher equation.
+        # PER-POSITION: narrow domain(c_t) via cipher equation +
+        # bigram arc consistency on the plaintext domains.
         for t in range(L):
             ct = cipher[t]
             Et = trajectory[t]
             for a in list(dp.domains[ct]):
                 x = Et[a]
-                if not (dp.domains[x] - {ct}):
+                pt_domain = dp.domains[x] - {ct}  # reflector exclusion
+                if not pt_domain:
                     dp.domains[ct].discard(a)
+                    continue
+                # Bigram arc consistency: does any pt value have a valid
+                # continuation at t+1 AND a valid predecessor at t-1?
+                if t < L - 1:
+                    c_next = cipher[t + 1]
+                    E_next = trajectory[t + 1]
+                    has_succ = False
+                    for pv in pt_domain:
+                        for b in dp.domains[c_next]:
+                            x2 = E_next[b]
+                            for pw in dp.domains[x2]:
+                                if pw != c_next and _bg_valid(pv, pw):
+                                    has_succ = True
+                                    break
+                            if has_succ:
+                                break
+                        if has_succ:
+                            break
+                    if not has_succ:
+                        dp.domains[ct].discard(a)
+                        continue
+                if t > 0:
+                    c_prev = cipher[t - 1]
+                    E_prev = trajectory[t - 1]
+                    has_pred = False
+                    for pv in pt_domain:
+                        for b in dp.domains[c_prev]:
+                            x2 = E_prev[b]
+                            for pw in dp.domains[x2]:
+                                if pw != c_prev and _bg_valid(pw, pv):
+                                    has_pred = True
+                                    break
+                            if has_pred:
+                                break
+                        if has_pred:
+                            break
+                    if not has_pred:
+                        dp.domains[ct].discard(a)
             if dp.dead():
                 return False
 
@@ -237,19 +290,25 @@ def _cascade(
                 if dp.dead():
                     return False
 
-                # Bigram narrowing: domain(x) = possible P(x) = possible
-                # plaintext[t]. Exclude values that create bad bigrams
-                # with determined neighbors.
+                # N-gram narrowing: domain(x) = possible plaintext[t].
+                # Exclude values that create invalid bigrams/trigrams.
                 if t > 0 and plaintext[t - 1] is not None:
                     prev = plaintext[t - 1]
                     for v in list(dp.domains[x]):
-                        if excluded[prev][v]:
+                        if not _bg_valid(prev, v):
                             dp.domains[x].discard(v)
                             changed = True
+                    # Trigram: if t-2 also known
+                    if t > 1 and plaintext[t - 2] is not None:
+                        pp = plaintext[t - 2]
+                        for v in list(dp.domains[x]):
+                            if not _tg_valid(pp, prev, v):
+                                dp.domains[x].discard(v)
+                                changed = True
                 if t < L - 1 and plaintext[t + 1] is not None:
                     nxt = plaintext[t + 1]
                     for v in list(dp.domains[x]):
-                        if excluded[v][nxt]:
+                        if not _bg_valid(v, nxt):
                             dp.domains[x].discard(v)
                             changed = True
                 if dp.dead():
@@ -290,11 +349,26 @@ def _cascade(
                         return False
 
             if plaintext[t] is not None:
+                # Bigram checks.
                 if t > 0 and plaintext[t - 1] is not None:
-                    if excluded[plaintext[t - 1]][plaintext[t]]:
+                    if not _bg_valid(plaintext[t - 1], plaintext[t]):
                         return False
                 if t < L - 1 and plaintext[t + 1] is not None:
-                    if excluded[plaintext[t]][plaintext[t + 1]]:
+                    if not _bg_valid(plaintext[t], plaintext[t + 1]):
+                        return False
+                # Trigram checks (bigram-of-bigram).
+                if t > 1 and plaintext[t - 1] is not None and plaintext[t - 2] is not None:
+                    if not _tg_valid(plaintext[t - 2], plaintext[t - 1], plaintext[t]):
+                        return False
+                if t < L - 2 and plaintext[t + 1] is not None and plaintext[t + 2] is not None:
+                    if not _tg_valid(plaintext[t], plaintext[t + 1], plaintext[t + 2]):
+                        return False
+                # Quadgram checks (trigram-of-trigram).
+                if (t > 2 and plaintext[t - 1] is not None
+                        and plaintext[t - 2] is not None
+                        and plaintext[t - 3] is not None):
+                    if not _qg_valid(plaintext[t - 3], plaintext[t - 2],
+                                     plaintext[t - 1], plaintext[t]):
                         return False
 
         if not dp.propagate_involution():
