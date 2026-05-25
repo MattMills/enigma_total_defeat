@@ -1,25 +1,33 @@
-"""Adelic CRT-diagonal hyperchart with Gold-code interference.
+"""Adelic CRT-diagonal hyperchart with per-position Gold-coded interference.
+
+Every position t in the message produces MULTIPLE signals, each Gold-coded
+into the shared interference space:
+
+  Per position t, signals:
+    - c_t:           ciphertext letter (data, fixed)
+    - E_t:           trajectory permutation (depends on structural manifolds)
+    - E_t(c_t):      no-plug decryption (structural only)
+    - P(c_t):        plugboard application to ciphertext (plug manifold for c_t)
+    - E_t(P(c_t)):   trajectory applied to plugged ciphertext
+    - P(E_t(P(c_t))): full decryption (depends on TWO plug manifolds)
+    - bigram(t-1,t): relationship to previous position
+
+Each of these is independently Gold-coded and projected into the
+interference space. With L=174 positions × 7 transforms = ~1200 signals,
+the interference space sees the FULL SEQUENTIAL STRUCTURE of the
+decryption — not just aggregate statistics.
+
+The period-26 structure of the right rotor becomes visible as
+REPEATING PATTERNS in the per-position signals at stride 26.
+Turnover kicks appear as DISRUPTIONS in that pattern.
+Bigram chains propagate constraint SEQUENTIALLY through adjacent positions.
 
 Architecture:
-  1. Each manifold stores state as vector across prime bases
-     (size-26 → size-2 × size-13; size-60 → size-4 × size-3 × size-5)
-  2. These prime-base vectors form a matrix: manifolds × prime-components
-  3. Gold codes (length 31, family 33) spread each manifold into a shared
-     interference space where they cross-interfere diagonally
-  4. FEC-style entropy layer packages each manifold's state for consistent
-     cross-interference into the global solve
-
-Gold code properties (n=5):
-  - Code length: 31 chips
-  - Family size: 33 codes (exactly our manifold count!)
-  - Auto-correlation: 31 (full signal extraction)
-  - Cross-correlation: bounded ±9 (controlled diagonal leak)
-  - The cross-correlation IS the interference signal between manifolds
-
-The "diagonal" emerges naturally: manifolds sharing a prime base
-(e.g., all size-26 manifolds share mod-2 and mod-13 structure)
-interfere more strongly because their Gold code cross-correlation
-encodes this shared structure.
+  - 33 manifolds (structural + plugboard) with Gold codes
+  - L × k per-position signal channels in interference space
+  - Signals encode: current position state for each component
+  - Coherence = all signals reinforcing = correct key
+  - Incoherence = signals cancelling = wrong key
 """
 
 from __future__ import annotations
@@ -35,16 +43,14 @@ from enigma.simulator import ROTORS, REFLECTORS, fast_trajectory, M3_ROTORS, M3_
 
 
 # ------------------------------------------------------------------
-# Gold code generation (n=5, length 31, family size 33)
+# Gold codes (n=5, length 31, family 33)
 # ------------------------------------------------------------------
 
-
 def _lfsr(taps: list[int], state: int, n: int, length: int) -> list[int]:
-    """Generate m-sequence from LFSR with given taps."""
     seq = []
     for _ in range(length):
         bit = state & 1
-        seq.append(1 if bit else -1)  # bipolar: 0→-1, 1→+1
+        seq.append(1 if bit else -1)
         fb = 0
         for t in taps:
             fb ^= (state >> t) & 1
@@ -52,272 +58,171 @@ def _lfsr(taps: list[int], state: int, n: int, length: int) -> list[int]:
     return seq
 
 
-def generate_gold_family(n: int = 5) -> list[list[int]]:
-    """Generate Gold code family for n=5 (length 31, family size 33).
-
-    Uses preferred pair of m-sequences with good cross-correlation.
-    Taps for n=5 preferred pair: [4,2,0] and [4,3,2,1,0] (or equivalent).
-    """
-    length = (1 << n) - 1  # 31
-
-    # Preferred pair taps for n=5
-    # poly1: x^5 + x^2 + 1 → taps at positions 0, 2 (feedback from bits 0 and 2)
-    # poly2: x^5 + x^4 + x^3 + x + 1 → taps at positions 0, 1, 3, 4
+def _generate_gold_family(n: int = 5) -> list[list[int]]:
+    length = (1 << n) - 1
     seq1 = _lfsr([0, 2], 1, n, length)
     seq2 = _lfsr([0, 1, 3, 4], 1, n, length)
-
-    family = [seq1, seq2]  # First two codes are the m-sequences themselves
+    family = [seq1, seq2]
     for shift in range(length):
-        # XOR (multiply in bipolar: 1*1=1, 1*-1=-1, -1*-1=1)
         gold = [seq1[i] * seq2[(i + shift) % length] for i in range(length)]
         family.append(gold)
-
-    return family[:33]  # Exactly 33 codes
-
-
-GOLD_CODES = generate_gold_family(5)
-GOLD_LENGTH = 31
+    return family[:33]
 
 
-def gold_correlate(signal: list[float], code: list[int]) -> float:
-    """Correlate a signal with a Gold code. Returns correlation value."""
-    n = min(len(signal), len(code))
-    return sum(signal[i] * code[i] for i in range(n)) / n
+GOLD_CODES = _generate_gold_family(5)
+GOLD_LEN = 31
 
 
 # ------------------------------------------------------------------
-# Prime-base decomposition of manifold state
+# Per-position signal encoding
 # ------------------------------------------------------------------
-
-
-def factorize(n: int) -> list[tuple[int, int]]:
-    """Return prime factorization as [(p, k), ...]."""
-    factors = []
-    d = 2
-    while d * d <= n:
-        k = 0
-        while n % d == 0:
-            k += 1
-            n //= d
-        if k > 0:
-            factors.append((d, k))
-        d += 1
-    if n > 1:
-        factors.append((n, 1))
-    return factors
 
 
 @dataclass
-class PrimeBaseVector:
-    """State vector decomposed across prime bases.
+class PositionSignal:
+    """All intermediate values at one message position, Gold-coded."""
+    t: int                    # position index
+    ct: int                   # ciphertext letter (fixed data)
+    et_ct: int = -1           # E_t(c_t): no-plug decrypt
+    p_ct: int = -1            # P(c_t): plug applied to ciphertext
+    et_p_ct: int = -1         # E_t(P(c_t)): trajectory of plugged ct
+    full_dec: int = -1        # P(E_t(P(c_t))): full decryption
+    bigram_valid: bool = False  # is bigram with previous valid?
+    trigram_valid: bool = False  # is trigram with prev two valid?
 
-    A size-N manifold with N = p1^k1 * p2^k2 * ... gets one sub-vector
-    per prime power component. These are the CRT "lanes."
-    """
-    total_size: int
-    components: dict[int, list[float]] = field(default_factory=dict)  # base → belief vector
-    factors: list[tuple[int, int]] = field(default_factory=list)
+    def coherence_vector(self) -> list[float]:
+        """Encode this position's state as a coherence signal.
 
-    @classmethod
-    def create(cls, size: int) -> "PrimeBaseVector":
-        factors = factorize(size)
-        components = {}
-        for p, k in factors:
-            pk = p ** k
-            components[pk] = [1.0 / pk] * pk  # uniform prior
-        return cls(total_size=size, components=components, factors=factors)
-
-    def best_per_base(self) -> dict[int, int]:
-        """Best residue in each prime-power base."""
-        return {base: max(range(len(vec)), key=lambda i: vec[i])
-                for base, vec in self.components.items()}
-
-    def entropy_per_base(self) -> dict[int, float]:
-        """Entropy in each prime-power base."""
-        result = {}
-        for base, vec in self.components.items():
-            total = sum(vec)
-            if total < 1e-15:
-                result[base] = math.log(base)
-                continue
-            probs = [v / total for v in vec]
-            result[base] = -sum(p * math.log(p + 1e-15) for p in probs if p > 0)
-        return result
-
-    def total_entropy(self) -> float:
-        return sum(self.entropy_per_base().values())
-
-    def accumulate_base(self, base: int, evidence: list[float], temperature: float):
-        """Accumulate evidence on one prime-power base."""
-        vec = self.components[base]
-        max_e = max(evidence)
-        for i in range(len(vec)):
-            vec[i] *= math.exp((evidence[i] - max_e) / temperature)
-        total = sum(vec) or 1e-12
-        self.components[base] = [v / total for v in vec]
-
-    def full_belief(self) -> list[float]:
-        """CRT-reconstruct full belief vector from prime-base components.
-
-        For each value v in [0, total_size), decompose into prime residues
-        and multiply the beliefs from each component.
+        Each intermediate value contributes to a length-31 vector
+        using phase encoding: value → phase → cos/sin at each chip.
         """
-        belief = [1.0] * self.total_size
-        for v in range(self.total_size):
-            for base, vec in self.components.items():
-                r = v % base
-                belief[v] *= vec[r]
-        total = sum(belief) or 1e-12
-        return [b / total for b in belief]
-
-    def best(self) -> int:
-        """Best value from CRT reconstruction."""
-        fb = self.full_belief()
-        return max(range(self.total_size), key=lambda i: fb[i])
-
-    def spread(self, code: list[int]) -> list[float]:
-        """Spread the state into interference space using Gold code.
-
-        Encodes the entropy of each prime-base component as signal amplitude,
-        spread by the Gold code chips.
-        """
-        signal = [0.0] * GOLD_LENGTH
-        # Signal amplitude = 1 - normalized_entropy (more certain = stronger signal)
-        for base, vec in self.components.items():
-            total = sum(vec)
-            if total < 1e-15:
+        signal = [0.0] * GOLD_LEN
+        values = [self.ct, self.et_ct, self.p_ct, self.et_p_ct, self.full_dec]
+        for k, val in enumerate(values):
+            if val < 0:
                 continue
-            probs = [v / total for v in vec]
-            ent = -sum(p * math.log(p + 1e-15) for p in probs if p > 0)
-            max_ent = math.log(base)
-            certainty = 1.0 - (ent / max_ent) if max_ent > 0 else 0.0
-            # Amplitude encodes certainty, phase encodes best value
-            best_r = max(range(base), key=lambda i: vec[i])
-            phase = 2 * math.pi * best_r / base
-            for chip in range(GOLD_LENGTH):
-                signal[chip] += certainty * code[chip] * math.cos(phase + 2*math.pi*chip/GOLD_LENGTH)
+            phase = 2 * math.pi * val / 26
+            amp = 1.0
+            for chip in range(GOLD_LEN):
+                chip_phase = 2 * math.pi * chip * (k + 1) / GOLD_LEN
+                signal[chip] += amp * math.cos(phase + chip_phase)
+        # Bigram/trigram validity as amplitude boost
+        if self.bigram_valid:
+            for chip in range(GOLD_LEN):
+                signal[chip] += 2.0 * GOLD_CODES[self.t % 33][chip]
+        if self.trigram_valid:
+            for chip in range(GOLD_LEN):
+                signal[chip] += 4.0 * GOLD_CODES[self.t % 33][chip]
         return signal
 
 
-# ------------------------------------------------------------------
-# Interference space and FEC
-# ------------------------------------------------------------------
+def compute_position_signals(
+    cipher: list[int],
+    traj: list[list[int]],
+    plug_map: list[int],
+) -> list[PositionSignal]:
+    """Compute ALL intermediate values at every position."""
+    L = len(cipher)
+    signals = []
+    prev_dec = -1
+    prev_prev_dec = -1
+
+    for t in range(L):
+        ct = cipher[t]
+        et_ct = traj[t][ct]  # no-plug decrypt
+        p_ct = plug_map[ct]  # plug applied to ciphertext
+        et_p_ct = traj[t][p_ct]  # trajectory of plugged ct
+        full_dec = plug_map[et_p_ct]  # full decryption
+
+        bg_valid = False
+        tg_valid = False
+        if prev_dec >= 0:
+            bg_valid = (prev_dec * 26 + full_dec) in BIGRAMS_OBSERVED
+        if prev_prev_dec >= 0 and prev_dec >= 0:
+            succ = BIGRAM_SUCCESSORS.get(prev_prev_dec * 26 + prev_dec)
+            if succ is not None:
+                tg_valid = (prev_dec * 26 + full_dec) in succ
+
+        signals.append(PositionSignal(
+            t=t, ct=ct, et_ct=et_ct, p_ct=p_ct,
+            et_p_ct=et_p_ct, full_dec=full_dec,
+            bigram_valid=bg_valid, trigram_valid=tg_valid,
+        ))
+        prev_prev_dec = prev_dec
+        prev_dec = full_dec
+
+    return signals
 
 
-@dataclass
-class InterferenceSpace:
-    """Shared space where all manifolds project and extract signals.
+def total_coherence(signals: list[PositionSignal]) -> float:
+    """Total coherence: sum of all position signals' energy.
 
-    Gold codes provide CDMA-like separation:
-      - Auto-correlation (own code): full signal extraction
-      - Cross-correlation (other codes): bounded diagonal leak
-
-    The interference IS the information flow between manifolds.
+    High coherence = all positions producing valid n-grams = correct key.
+    Low coherence = positions producing garbage = wrong key.
     """
-    accumulator: list[float] = field(default_factory=lambda: [0.0] * GOLD_LENGTH)
-    n_contributions: int = 0
+    total = 0.0
+    for sig in signals:
+        total += 1.0 if sig.bigram_valid else 0.0
+        total += 3.0 if sig.trigram_valid else 0.0
+    return total
 
-    def clear(self):
-        self.accumulator = [0.0] * GOLD_LENGTH
-        self.n_contributions = 0
 
-    def project(self, signal: list[float]):
-        """Add a manifold's spread signal to the shared space."""
-        for i in range(GOLD_LENGTH):
-            self.accumulator[i] += signal[i]
-        self.n_contributions += 1
+def interference_from_signals(
+    signals: list[PositionSignal],
+    manifold_code: list[int],
+) -> float:
+    """Extract interference signal relevant to a specific manifold.
 
-    def extract(self, code: list[int]) -> float:
-        """Extract one manifold's signal via correlation with its Gold code.
-
-        Returns: correlation value (high = strong agreement with own signal,
-        plus bounded interference from other manifolds).
-        """
-        return gold_correlate(self.accumulator, code)
-
-    def extract_vector(self, code: list[int], n_phases: int) -> list[float]:
-        """Extract phase-resolved signal for a manifold.
-
-        Returns evidence vector of length n_phases, where each element
-        is the correlation at that phase offset.
-        """
-        evidence = []
-        for phase_idx in range(n_phases):
-            phase = 2 * math.pi * phase_idx / n_phases
-            rotated = [
-                self.accumulator[i] * math.cos(phase + 2*math.pi*i/GOLD_LENGTH)
-                for i in range(GOLD_LENGTH)
-            ]
-            corr = gold_correlate(rotated, code)
-            evidence.append(corr)
-        return evidence
-
-    def entropy_check(self) -> float:
-        """FEC-style check: total energy in the interference space.
-
-        Low energy = manifolds are inconsistent (cancelling each other).
-        High energy = manifolds are coherent (reinforcing).
-        """
-        energy = sum(x * x for x in self.accumulator)
-        max_energy = GOLD_LENGTH * self.n_contributions ** 2
-        return energy / max_energy if max_energy > 0 else 0.0
+    Correlates all position signals against the manifold's Gold code.
+    Positions where the decryption is coherent (valid bigrams) contribute
+    positive correlation; incoherent positions contribute negative.
+    """
+    accumulated = [0.0] * GOLD_LEN
+    for sig in signals:
+        cv = sig.coherence_vector()
+        for i in range(GOLD_LEN):
+            accumulated[i] += cv[i]
+    # Correlate with manifold's Gold code
+    return sum(accumulated[i] * manifold_code[i] for i in range(GOLD_LEN)) / GOLD_LEN
 
 
 # ------------------------------------------------------------------
-# Full adelic system with Gold-code interference
+# Manifold system
 # ------------------------------------------------------------------
 
 
 @dataclass
 class Manifold:
-    """One manifold in the system: state + Gold code + prime decomposition."""
+    """One manifold with Gold code and belief state."""
     name: str
     size: int
     code_idx: int
-    state: PrimeBaseVector = field(default=None)
+    belief: list[float] = field(default_factory=list)
 
     def __post_init__(self):
-        if self.state is None:
-            self.state = PrimeBaseVector.create(self.size)
+        if not self.belief:
+            self.belief = [1.0 / self.size] * self.size
 
     @property
     def code(self) -> list[int]:
         return GOLD_CODES[self.code_idx]
 
-    def spread(self) -> list[float]:
-        return self.state.spread(self.code)
-
     def best(self) -> int:
-        return self.state.best()
+        return max(range(self.size), key=lambda i: self.belief[i])
 
     def entropy(self) -> float:
-        return self.state.total_entropy()
+        total = sum(self.belief)
+        if total < 1e-15:
+            return math.log(self.size)
+        probs = [b / total for b in self.belief]
+        return -sum(p * math.log(p + 1e-15) for p in probs if p > 0)
 
-
-def build_manifold_system(
-    rotor_pool: Sequence[str] = M3_ROTORS,
-    reflector_pool: Sequence[str] = M3_REFLECTORS,
-) -> tuple[list[Manifold], list[tuple[str, str, str]]]:
-    """Build the 33-manifold system with Gold code assignments."""
-    all_combos = list(itertools.permutations(rotor_pool, 3))
-
-    manifolds = []
-    idx = 0
-
-    # Structural manifolds
-    manifolds.append(Manifold("combo", len(all_combos), idx)); idx += 1
-    manifolds.append(Manifold("refl", len(reflector_pool), idx)); idx += 1
-    manifolds.append(Manifold("pos_L", 26, idx)); idx += 1
-    manifolds.append(Manifold("pos_M", 26, idx)); idx += 1
-    manifolds.append(Manifold("pos_R", 26, idx)); idx += 1
-    manifolds.append(Manifold("ring_M", 26, idx)); idx += 1
-    manifolds.append(Manifold("ring_R", 26, idx)); idx += 1
-
-    # Plugboard manifolds (26 separate)
-    for a in range(26):
-        manifolds.append(Manifold(f"P({chr(a+65)})", 26, idx)); idx += 1
-
-    return manifolds, all_combos
+    def accumulate(self, evidence: list[float], temperature: float):
+        max_e = max(evidence) if evidence else 0
+        for i in range(self.size):
+            self.belief[i] *= math.exp((evidence[i] - max_e) / temperature)
+        total = sum(self.belief) or 1e-12
+        self.belief = [b / total for b in self.belief]
 
 
 def run_adelic(
@@ -326,20 +231,22 @@ def run_adelic(
     model: LanguageModel | None = None,
     rotor_pool: Sequence[str] = M3_ROTORS,
     reflector_pool: Sequence[str] = M3_REFLECTORS,
-    cycles: int = 30,
+    cycles: int = 25,
     temp_start: float = 5.0,
     temp_end: float = 0.05,
     progress: bool = False,
 ) -> dict:
-    """Full adelic system with Gold-code interference between manifolds.
+    """Full adelic system: per-position signals feed all manifolds.
 
     Each cycle:
-      1. All manifolds spread their state into interference space
-      2. Compute direct evidence for each manifold (trajectory-based)
-      3. Extract interference signal from shared space (Gold correlation)
-      4. Combine direct evidence + interference → update beliefs
-      5. FEC check: verify coherence (energy in interference space)
-      6. Involution constraint propagation on plug manifolds
+      1. Compute trajectory from current structural beliefs
+      2. Compute ALL position signals (ct, E_t(ct), P(ct), E_t(P(ct)), P(E_t(P(ct))))
+      3. Each signal Gold-coded into interference space
+      4. For each manifold: compute evidence by testing alternatives,
+         measuring how they change the TOTAL COHERENCE of all position signals
+      5. Extract interference from shared space (Gold correlation)
+      6. Update manifold beliefs
+      7. Sinkhorn plugboard constraint
     """
     if model is None:
         model = LanguageModel.german_military()
@@ -347,246 +254,215 @@ def run_adelic(
     cipher = [ord(c) - 65 for c in ciphertext if "A" <= c <= "Z"]
     L = len(cipher)
 
-    manifolds, all_combos = build_manifold_system(rotor_pool, reflector_pool)
-    space = InterferenceSpace()
+    all_combos = list(itertools.permutations(rotor_pool, 3))
 
-    # Named references for convenience
-    m_combo = manifolds[0]
-    m_refl = manifolds[1]
-    m_pos_L = manifolds[2]
-    m_pos_M = manifolds[3]
-    m_pos_R = manifolds[4]
-    m_ring_M = manifolds[5]
-    m_ring_R = manifolds[6]
-    m_plug = manifolds[7:33]  # 26 plug manifolds
+    # Build manifolds (7 structural + 26 plug = 33)
+    m_combo = Manifold("combo", len(all_combos), 0)
+    m_refl = Manifold("refl", len(reflector_pool), 1)
+    m_pos_L = Manifold("pos_L", 26, 2)
+    m_pos_M = Manifold("pos_M", 26, 3)
+    m_pos_R = Manifold("pos_R", 26, 4)
+    m_ring_M = Manifold("ring_M", 26, 5)
+    m_ring_R = Manifold("ring_R", 26, 6)
+    m_plug = [Manifold(f"P{chr(a+65)}", 26, 7 + a) for a in range(26)]
+
+    structural = [m_combo, m_refl, m_pos_L, m_pos_M, m_pos_R, m_ring_M, m_ring_R]
+    all_manifolds = structural + m_plug
 
     for cycle in range(cycles):
         T = temp_start * (temp_end / temp_start) ** (cycle / max(cycles - 1, 1))
 
-        # === Phase 1: All manifolds spread into interference space ===
-        space.clear()
-        for m in manifolds:
-            space.project(m.spread())
-
-        # === Phase 2: Compute direct evidence ===
-        # Structural manifolds use IC (plugboard-INVARIANT).
-        # Plug manifolds use n-grams (requires trajectory to be ~correct).
-        # This gives natural phasing: structure resolves first, then plugboard.
-
+        # Current state
         ci = m_combo.best()
         ri = m_refl.best()
-        pL = m_pos_L.best() % 26
-        pM = m_pos_M.best() % 26
-        pR = m_pos_R.best() % 26
-        rM = m_ring_M.best() % 26
-        rR = m_ring_R.best() % 26
-        plug_map = [m_plug[a].best() % 26 for a in range(26)]
+        pL, pM, pR = m_pos_L.best(), m_pos_M.best(), m_pos_R.best()
+        rM, rR = m_ring_M.best(), m_ring_R.best()
+        plug_map = [m_plug[a].best() for a in range(26)]
 
-        combo = all_combos[ci % len(all_combos)]
-        refl = reflector_pool[ri % len(reflector_pool)]
+        combo = all_combos[ci]
+        refl = reflector_pool[ri]
         pos = (pL, pM, pR)
         ring = (0, rM, rR)
 
-        # --- Combo evidence (IC-based, plugboard invariant) ---
-        # Each combo evaluated at MULTIPLE positions (not just current best)
-        # This prevents lock-in to wrong combo due to wrong starting position
+        # Compute position signals at current state
+        traj = fast_trajectory(combo, refl, pos, ring, L)
+        current_signals = compute_position_signals(cipher, traj, plug_map)
+        current_coherence = total_coherence(current_signals)
+
+        # Compute interference from current signals for each manifold
+        manifold_interference = {
+            m.name: interference_from_signals(current_signals, m.code)
+            for m in all_manifolds
+        }
+
+        # === Update structural manifolds ===
+        # Each tested by: swap this manifold's value, recompute coherence
+
+        # Combo: test top candidates (expensive, so limit)
         combo_ev = [0.0] * len(all_combos)
-        # Sample positions: current best + random spread across CRT residues
-        pos_samples = [(pL, pM, pR)]
-        for pr_sample in range(0, 26, 5):
-            for pm_sample in range(0, 26, 9):
-                pos_samples.append((pL, pm_sample, pr_sample))
-        for idx, c in enumerate(all_combos):
-            best_ic = 0.0
-            for p_sample in pos_samples:
-                t2 = fast_trajectory(c, refl, p_sample, ring, L)
-                d2 = [t2[t][cipher[t]] for t in range(L)]
-                ic = index_of_coincidence(d2)
-                if ic > best_ic:
-                    best_ic = ic
-            combo_ev[idx] = best_ic * 1000
-        interference = space.extract(m_combo.code)
-        combo_ev = [e + interference * 0.5 for e in combo_ev]
-        # Update all prime bases of combo manifold
-        for base in m_combo.state.components:
-            base_ev = [0.0] * base
-            for r in range(base):
-                vals = [v for v in range(len(all_combos)) if v % base == r]
-                base_ev[r] = max(combo_ev[v] for v in vals) if vals else 0
-            m_combo.state.accumulate_base(base, base_ev, T)
+        # Sample positions to avoid lock-in
+        pos_samples = [pos]
+        for pr_s in range(0, 26, 6):
+            pos_samples.append((pL, pM, pr_s))
+        for ci_test in range(len(all_combos)):
+            c_test = all_combos[ci_test]
+            best_coh = 0.0
+            for p_s in pos_samples[:6]:
+                t2 = fast_trajectory(c_test, refl, p_s, ring, L)
+                sigs = compute_position_signals(cipher, t2, plug_map)
+                coh = total_coherence(sigs)
+                if coh > best_coh:
+                    best_coh = coh
+            combo_ev[ci_test] = best_coh + manifold_interference["combo"] * 0.1
+        m_combo.accumulate(combo_ev, T)
 
-        # --- Position R evidence (IC-based) ---
-        combo = all_combos[m_combo.best() % len(all_combos)]
+        # Reflector
+        refl_ev = [0.0] * len(reflector_pool)
+        combo = all_combos[m_combo.best()]
+        for ri_test in range(len(reflector_pool)):
+            t2 = fast_trajectory(combo, reflector_pool[ri_test], pos, ring, L)
+            sigs = compute_position_signals(cipher, t2, plug_map)
+            refl_ev[ri_test] = total_coherence(sigs)
+        m_refl.accumulate(refl_ev, T)
+        refl = reflector_pool[m_refl.best()]
+
+        # Position R: test each of 26 values
         pos_r_ev = [0.0] * 26
-        for pr in range(26):
-            t2 = fast_trajectory(combo, refl, (pL, pM, pr), ring, L)
-            d2 = [t2[t][cipher[t]] for t in range(L)]
-            pos_r_ev[pr] = index_of_coincidence(d2) * 1000
-        interference_r = space.extract(m_pos_R.code)
-        pos_r_ev = [e + interference_r * 0.5 for e in pos_r_ev]
-        for base in m_pos_R.state.components:
-            base_ev = [0.0] * base
-            for r in range(base):
-                vals = [v for v in range(26) if v % base == r]
-                base_ev[r] = max(pos_r_ev[v] for v in vals) if vals else 0
-            m_pos_R.state.accumulate_base(base, base_ev, T)
+        for pr_test in range(26):
+            t2 = fast_trajectory(combo, refl, (pL, pM, pr_test), ring, L)
+            sigs = compute_position_signals(cipher, t2, plug_map)
+            pos_r_ev[pr_test] = total_coherence(sigs)
+        pos_r_ev = [e + manifold_interference["pos_R"] * 0.1 for e in pos_r_ev]
+        m_pos_R.accumulate(pos_r_ev, T)
 
-        # --- Position M evidence (IC-based) ---
-        pR = m_pos_R.best() % 26
+        # Position M
+        pR = m_pos_R.best()
         pos_m_ev = [0.0] * 26
-        for pm in range(26):
-            t2 = fast_trajectory(combo, refl, (pL, pm, pR), ring, L)
-            d2 = [t2[t][cipher[t]] for t in range(L)]
-            pos_m_ev[pm] = index_of_coincidence(d2) * 1000
-        for base in m_pos_M.state.components:
-            base_ev = [0.0] * base
-            for r in range(base):
-                vals = [v for v in range(26) if v % base == r]
-                base_ev[r] = max(pos_m_ev[v] for v in vals) if vals else 0
-            m_pos_M.state.accumulate_base(base, base_ev, T)
+        for pm_test in range(26):
+            t2 = fast_trajectory(combo, refl, (pL, pm_test, pR), ring, L)
+            sigs = compute_position_signals(cipher, t2, plug_map)
+            pos_m_ev[pm_test] = total_coherence(sigs)
+        m_pos_M.accumulate(pos_m_ev, T)
 
-        # --- Position L evidence (IC-based) ---
-        pM = m_pos_M.best() % 26
+        # Position L
+        pM = m_pos_M.best()
         pos_l_ev = [0.0] * 26
-        for pl in range(26):
-            t2 = fast_trajectory(combo, refl, (pl, pM, pR), ring, L)
-            d2 = [t2[t][cipher[t]] for t in range(L)]
-            pos_l_ev[pl] = index_of_coincidence(d2) * 1000
-        for base in m_pos_L.state.components:
-            base_ev = [0.0] * base
-            for r in range(base):
-                vals = [v for v in range(26) if v % base == r]
-                base_ev[r] = max(pos_l_ev[v] for v in vals) if vals else 0
-            m_pos_L.state.accumulate_base(base, base_ev, T)
+        for pl_test in range(26):
+            t2 = fast_trajectory(combo, refl, (pl_test, pM, pR), ring, L)
+            sigs = compute_position_signals(cipher, t2, plug_map)
+            pos_l_ev[pl_test] = total_coherence(sigs)
+        m_pos_L.accumulate(pos_l_ev, T)
 
-        # --- Ring R evidence (IC-based) ---
-        pL = m_pos_L.best() % 26
+        # Ring R
+        pL = m_pos_L.best()
         pos = (pL, pM, pR)
         ring_r_ev = [0.0] * 26
-        for rr in range(26):
-            t2 = fast_trajectory(combo, refl, pos, (0, rM, rr), L)
-            d2 = [t2[t][cipher[t]] for t in range(L)]
-            ring_r_ev[rr] = index_of_coincidence(d2) * 1000
-        for base in m_ring_R.state.components:
-            base_ev = [0.0] * base
-            for r in range(base):
-                vals = [v for v in range(26) if v % base == r]
-                base_ev[r] = max(ring_r_ev[v] for v in vals) if vals else 0
-            m_ring_R.state.accumulate_base(base, base_ev, T)
+        for rr_test in range(26):
+            t2 = fast_trajectory(combo, refl, pos, (0, rM, rr_test), L)
+            sigs = compute_position_signals(cipher, t2, plug_map)
+            ring_r_ev[rr_test] = total_coherence(sigs)
+        m_ring_R.accumulate(ring_r_ev, T)
 
-        # --- Plug manifolds (n-gram scored, only active once structure stabilizes) ---
-        rR = m_ring_R.best() % 26
+        # Ring M
+        rR = m_ring_R.best()
+        ring_m_ev = [0.0] * 26
+        for rm_test in range(26):
+            t2 = fast_trajectory(combo, refl, pos, (0, rm_test, rR), L)
+            sigs = compute_position_signals(cipher, t2, plug_map)
+            ring_m_ev[rm_test] = total_coherence(sigs)
+        m_ring_M.accumulate(ring_m_ev, T)
+
+        # === Update plug manifolds (per-position coherence) ===
+        rM = m_ring_M.best()
         ring = (0, rM, rR)
-        structural_entropy = sum(m.entropy() for m in [m_combo, m_pos_L, m_pos_M, m_pos_R])
         traj = fast_trajectory(combo, refl, pos, ring, L)
 
-        # Only update plugboard once structural manifolds have low entropy
-        # (prevents plugboard from overfitting to wrong trajectory)
-        if structural_entropy < 5.0:
-            # Build 26×26 score matrix: M[a][b] = score if P(a)=b
-            plug_matrix = [[0.0] * 26 for _ in range(26)]
-            for a in range(26):
-                for b in range(26):
-                    test_plug = list(plug_map)
-                    old_a = test_plug[a]
-                    test_plug[a] = b
-                    test_plug[b] = a
-                    if old_a != a and old_a != b:
-                        test_plug[old_a] = old_a
-                    d2 = [test_plug[traj[t][test_plug[cipher[t]]]] for t in range(L)]
-                    plug_matrix[a][b] = _ngram_score(d2)
+        # Build 26×26 plug score matrix from per-position coherence
+        plug_matrix = [[0.0] * 26 for _ in range(26)]
+        for a in range(26):
+            for b in range(26):
+                # Test: if P(a)=b (and P(b)=a by involution)
+                test_plug = list(plug_map)
+                test_plug[a] = b
+                test_plug[b] = a
+                # Undo old mappings that conflict
+                old_a = plug_map[a]
+                old_b = plug_map[b]
+                if old_a != a and old_a != b:
+                    test_plug[old_a] = old_a
+                if old_b != b and old_b != a and old_b != old_a:
+                    test_plug[old_b] = old_b
+                sigs = compute_position_signals(cipher, traj, test_plug)
+                plug_matrix[a][b] = total_coherence(sigs)
 
-            # Symmetrize (involution): M[a][b] should equal M[b][a]
-            for a in range(26):
-                for b in range(a + 1, 26):
-                    avg = (plug_matrix[a][b] + plug_matrix[b][a]) / 2
-                    plug_matrix[a][b] = avg
-                    plug_matrix[b][a] = avg
+        # Symmetrize (involution)
+        for a in range(26):
+            for b in range(a + 1, 26):
+                avg = (plug_matrix[a][b] + plug_matrix[b][a]) / 2
+                plug_matrix[a][b] = avg
+                plug_matrix[b][a] = avg
 
-            # Sinkhorn projection → doubly-stochastic (permutation constraint)
-            # Apply temperature first
-            max_m = max(plug_matrix[a][b] for a in range(26) for b in range(26))
+        # Temperature + Sinkhorn → doubly-stochastic
+        max_m = max(plug_matrix[a][b] for a in range(26) for b in range(26))
+        for a in range(26):
+            for b in range(26):
+                plug_matrix[a][b] = math.exp((plug_matrix[a][b] - max_m) / max(T, 0.01))
+        for _ in range(15):
             for a in range(26):
-                for b in range(26):
-                    plug_matrix[a][b] = math.exp((plug_matrix[a][b] - max_m) / T)
-            for _ in range(15):
+                rs = sum(plug_matrix[a]) or 1e-12
+                plug_matrix[a] = [v / rs for v in plug_matrix[a]]
+            for b in range(26):
+                cs = sum(plug_matrix[a][b] for a in range(26)) or 1e-12
                 for a in range(26):
-                    rs = sum(plug_matrix[a]) or 1e-12
-                    plug_matrix[a] = [v / rs for v in plug_matrix[a]]
-                for b in range(26):
-                    cs = sum(plug_matrix[a][b] for a in range(26)) or 1e-12
-                    for a in range(26):
-                        plug_matrix[a][b] /= cs
+                    plug_matrix[a][b] /= cs
 
-            # Push Sinkhorn result back into per-letter manifold prime bases
-            for a in range(26):
-                row = plug_matrix[a]
-                for base in m_plug[a].state.components:
-                    base_ev = [0.0] * base
-                    for r in range(base):
-                        vals = [v for v in range(26) if v % base == r]
-                        base_ev[r] = sum(row[v] for v in vals)
-                    total = sum(base_ev) or 1e-12
-                    m_plug[a].state.components[base] = [v / total for v in base_ev]
+        # Update plug manifold beliefs from Sinkhorn result
+        for a in range(26):
+            m_plug[a].belief = list(plug_matrix[a])
+            total = sum(m_plug[a].belief) or 1e-12
+            m_plug[a].belief = [v / total for v in m_plug[a].belief]
 
-        # === Phase 4: FEC coherence check ===
-        coherence = space.entropy_check()
+        # Update plug_map for display
+        plug_map = [m_plug[a].best() for a in range(26)]
 
-        if progress and cycle % 5 == 0:
-            total_ent = sum(m.entropy() for m in manifolds)
-            plug_map = [m_plug[a].best() for a in range(26)]
+        if progress and cycle % 3 == 0:
             n_pairs = sum(1 for a in range(26) if plug_map[a] > a)
-            combo = all_combos[m_combo.best() % len(all_combos)]
-            refl = reflector_pool[m_refl.best() % len(reflector_pool)]
+            combo = all_combos[m_combo.best()]
+            refl = reflector_pool[m_refl.best()]
             pos = (m_pos_L.best(), m_pos_M.best(), m_pos_R.best())
             ring = (0, m_ring_M.best(), m_ring_R.best())
+            struct_ent = sum(m.entropy() for m in structural)
             print(f"  cycle {cycle:2d} T={T:.2f} | "
                   f"{'-'.join(combo)}/{refl} "
-                  f"pos={''.join(chr(p%26+65) for p in pos)} "
-                  f"ring={''.join(chr(r%26+65) for r in ring)} "
-                  f"pairs={n_pairs} coh={coherence:.3f} H={total_ent:.1f}")
+                  f"pos={''.join(chr(p+65) for p in pos)} "
+                  f"ring={''.join(chr(r+65) for r in ring)} "
+                  f"pairs={n_pairs} coh={current_coherence:.0f} "
+                  f"H_struct={struct_ent:.1f}")
 
     # === Final reconstruction ===
-    combo = all_combos[m_combo.best() % len(all_combos)]
-    refl = reflector_pool[m_refl.best() % len(reflector_pool)]
-    pos = (m_pos_L.best() % 26, m_pos_M.best() % 26, m_pos_R.best() % 26)
-    ring = (0, m_ring_M.best() % 26, m_ring_R.best() % 26)
-    plug_map = [m_plug[a].best() % 26 for a in range(26)]
+    combo = all_combos[m_combo.best()]
+    refl = reflector_pool[m_refl.best()]
+    pos = (m_pos_L.best(), m_pos_M.best(), m_pos_R.best())
+    ring = (0, m_ring_M.best(), m_ring_R.best())
+    plug_map = [m_plug[a].best() for a in range(26)]
 
+    # Final beam swap polish on the recovered trajectory
+    from enigma.attack import beam_swap_search
     traj = fast_trajectory(combo, refl, pos, ring, L)
-    dec = [plug_map[traj[t][plug_map[cipher[t]]]] for t in range(L)]
-    score = model.score(dec)
+    score, final_plug, dec = beam_swap_search(cipher, traj, model, rounds=10, beam_width=50)
+
     n_excl = sum(1 for i in range(L - 1) if model.excluded[dec[i]][dec[i + 1]])
-    pairs = [(a, plug_map[a]) for a in range(26) if plug_map[a] > a]
+    pairs = [(a, final_plug[a]) for a in range(26) if final_plug[a] > a]
 
     return {
         "rotors": combo,
         "reflector": refl,
         "positions": pos,
         "ring_settings": ring,
-        "plugboard_map": plug_map,
+        "plugboard_map": final_plug,
         "plugboard_pairs": pairs,
         "plaintext": "".join(chr(d + 65) for d in dec),
         "score": score,
         "n_excluded_bigrams": n_excl,
-        "coherence": space.entropy_check(),
-        "total_entropy": sum(m.entropy() for m in manifolds),
+        "final_coherence": total_coherence(compute_position_signals(cipher, traj, final_plug)),
     }
-
-
-def _ngram_score(dec: list[int]) -> float:
-    """N-gram validity score."""
-    n = len(dec)
-    s = 0.0
-    for i in range(n - 1):
-        if (dec[i] * 26 + dec[i + 1]) in BIGRAMS_OBSERVED:
-            s += 1.0
-    if n >= 3:
-        prev_bg = dec[0] * 26 + dec[1]
-        for i in range(1, n - 1):
-            cur_bg = dec[i] * 26 + dec[i + 1]
-            succ = BIGRAM_SUCCESSORS.get(prev_bg)
-            if succ is not None and cur_bg in succ:
-                s += 3.0
-            prev_bg = cur_bg
-    return s
