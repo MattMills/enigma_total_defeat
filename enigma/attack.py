@@ -593,17 +593,36 @@ def beam_swap_search(
 ) -> tuple[float, list[int], list[int]]:
     """Recover the plugboard for a known trajectory via beam search.
 
-    Maintains ``beam_width`` parallel plugboard hypotheses. Each round,
-    every hypothesis is expanded by trying all C(26,2)=325 swap moves
-    and all unpair moves. The top ``beam_width`` unique results survive.
-
-    A swap move on (a,b): disconnect a and b from their current partners,
-    connect a↔b. An unpair move: disconnect an existing pair.
+    Scores by n-gram validity count: how many bigrams, trigrams, and
+    quadgrams in the decrypted text are valid German. The correct
+    plugboard maximizes this count (all n-grams valid). Wrong plugboards
+    produce invalid n-grams.
 
     Returns (score, plugboard_map, decrypted_ints).
     """
+    from enigma.ngram_data import BIGRAMS_OBSERVED, TRIGRAMS_OBSERVED, QUADGRAMS_OBSERVED
+
     def decrypt(pl: list[int]) -> list[int]:
         return [pl[trajectory[t][pl[cipher[t]]]] for t in range(len(cipher))]
+
+    def ngram_score(dec: list[int]) -> float:
+        """Score = count of valid n-grams (higher = better).
+
+        Weighted: quadgrams count most (most discriminating),
+        trigrams next, bigrams least.
+        """
+        n = len(dec)
+        s = 0.0
+        for i in range(n - 1):
+            if (dec[i] * 26 + dec[i + 1]) in BIGRAMS_OBSERVED:
+                s += 1.0
+        for i in range(n - 2):
+            if (dec[i] * 676 + dec[i + 1] * 26 + dec[i + 2]) in TRIGRAMS_OBSERVED:
+                s += 3.0
+        for i in range(n - 3):
+            if (dec[i] * 17576 + dec[i + 1] * 676 + dec[i + 2] * 26 + dec[i + 3]) in QUADGRAMS_OBSERVED:
+                s += 5.0
+        return s
 
     def apply_swap(plug: list[int], a: int, b: int) -> list[int]:
         p = list(plug)
@@ -620,7 +639,7 @@ def beam_swap_search(
         start_plug = list(range(26))
 
     beam: list[tuple[float, list[int]]] = [
-        (model.score(decrypt(start_plug)), list(start_plug))
+        (ngram_score(decrypt(start_plug)), list(start_plug))
     ]
 
     for _ in range(rounds):
@@ -629,7 +648,7 @@ def beam_swap_search(
             for a in range(26):
                 for b in range(a + 1, 26):
                     np = apply_swap(plug, a, b)
-                    s = model.score(decrypt(np))
+                    s = ngram_score(decrypt(np))
                     candidates.append((s, np))
             for a in range(26):
                 if plug[a] > a:
@@ -637,7 +656,7 @@ def beam_swap_search(
                     b = plug[a]
                     np[a] = a
                     np[b] = b
-                    s = model.score(decrypt(np))
+                    s = ngram_score(decrypt(np))
                     candidates.append((s, np))
 
         candidates.sort(reverse=True)
@@ -653,5 +672,7 @@ def beam_swap_search(
         if not beam:
             break
 
-    best_score, best_plug = beam[0]
-    return best_score, best_plug, decrypt(best_plug)
+    best_ngram, best_plug = beam[0]
+    best_dec = decrypt(best_plug)
+    lang_score = model.score(best_dec)
+    return lang_score, best_plug, best_dec
