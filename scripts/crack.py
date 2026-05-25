@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
-"""Crack Enigma messages using the full constraint pipeline.
+"""Crack Enigma messages using the full integrated pipeline.
 
 Chains all techniques topologically — each narrows the space for the next:
 
+  0. Topology:     O(1) cache lookup for known configurations
   1. Spectral:     identify candidate right rotors from ciphertext (if unknown)
   2. IC filter:    rank positions by plugboard-invariant IC (top 3%)
   3. Superposition: reject inconsistent trajectories (kills 59%)
   4. Domain cascade: narrow plugboard domains via differential (602→1 compatible)
   5. Beam swap:    recover plugboard with n-gram symbol scoring (10/10 in ~10s)
-  6. Coherence:    validate pairs, complete missing ones
+  6. Validation:   binary discriminator (0 excluded bigrams = correct)
 
 Each stage ENCLOSES the search space for the next. Longer messages
 converge faster because more positions = more constraints.
@@ -19,11 +20,11 @@ import itertools
 import sys
 import time
 
-from enigma.attack import beam_swap_search
-from enigma.language import LanguageModel, index_of_coincidence
+from enigma.language import LanguageModel
 from enigma.messages import MESSAGES, EnigmaMessage, MachineType, get_message
+from enigma.pipeline import crack_full, crack_with_known_trajectory, crack_zero_knowledge, PipelineResult
 from enigma.simulator import (
-    Enigma, Plugboard, fast_trajectory,
+    Enigma, Plugboard,
     M3_ROTORS, NAVAL_ROTORS, GREEK_ROTORS, M3_REFLECTORS, M4_REFLECTORS,
 )
 
@@ -48,147 +49,107 @@ def crack(msg: EnigmaMessage, model: LanguageModel, time_limit: float = 120.0) -
     if len(ct) < 20:
         return None
 
-    cipher = [ord(c) - 65 for c in ct]
-    L = len(cipher)
     t0 = time.time()
 
-    # --- Determine search space ---
-    if msg.rotors:
-        rotor_combos = [tuple(msg.rotors)]
-    elif msg.machine_type == MachineType.M4:
-        rotor_combos = list(itertools.permutations(NAVAL_ROTORS, 3))
-    else:
-        rotor_combos = list(itertools.permutations(M3_ROTORS, 3))
-
+    # --- Determine search space from message metadata ---
+    known_rotors = tuple(msg.rotors) if msg.rotors else None
     reflectors = [msg.reflector] if msg.reflector else (
         list(M4_REFLECTORS) if msg.machine_type == MachineType.M4 else list(M3_REFLECTORS)
     )
-
     rings = tuple(ord(c) - 65 for c in msg.ring_settings) if msg.ring_settings else (0, 0, 0)
+    known_pos = tuple(ord(c) - 65 for c in msg.initial_positions) if msg.initial_positions else None
 
+    rotor_pool = NAVAL_ROTORS if msg.machine_type == MachineType.M4 else M3_ROTORS
+
+    fourth_rotors = None
+    fourth_positions = None
     if msg.fourth_rotor:
-        fourth_configs = [(msg.fourth_rotor, ord(msg.fourth_position) - 65 if msg.fourth_position else 0)]
+        fourth_rotors = (msg.fourth_rotor,)
+        fourth_positions = [ord(msg.fourth_position) - 65] if msg.fourth_position else None
     elif msg.machine_type == MachineType.M4:
-        fourth_configs = [(gr, fp) for gr in GREEK_ROTORS for fp in range(26)]
-    else:
-        fourth_configs = [(None, 0)]
+        fourth_rotors = GREEK_ROTORS
+        fourth_positions = list(range(26))
 
-    position_known = bool(msg.initial_positions)
-    known_pos = tuple(ord(c) - 65 for c in msg.initial_positions) if position_known else None
-
-    total_combos = len(rotor_combos) * len(reflectors) * len(fourth_configs)
-    if not position_known:
-        total_combos *= 17576
-
-    # --- Stage 1: If position known, go straight to beam swap ---
-    if position_known and len(rotor_combos) == 1:
+    # --- Known trajectory: use crack_with_known_trajectory ---
+    if known_pos and known_rotors:
         fourth_kw = {}
-        if fourth_configs[0][0]:
-            fourth_kw = dict(fourth_rotor_name=fourth_configs[0][0],
-                             fourth_position=fourth_configs[0][1], fourth_ring=0)
-        traj = fast_trajectory(rotor_combos[0], reflectors[0], known_pos, rings, L, **fourth_kw)
-        score, plug, dec = beam_swap_search(cipher, traj, model, rounds=10, beam_width=50)
-        return _result(rotor_combos[0], reflectors[0], known_pos, rings, plug, dec, score,
-                       fourth_configs[0][0], fourth_configs[0][1], time.time() - t0, 1)
+        if msg.fourth_rotor:
+            fourth_kw["fourth_rotor_name"] = msg.fourth_rotor
+            fourth_kw["fourth_position"] = ord(msg.fourth_position) - 65 if msg.fourth_position else 0
+        result = crack_with_known_trajectory(
+            ct, known_rotors, reflectors[0], known_pos, rings,
+            model=model, beam_rounds=12, beam_width=80,
+            use_domain_cascade=True, **fourth_kw,
+        )
+        return _from_pipeline_result(result)
 
-    # --- Stage 2: Sweep with superposition pre-filter + beam swap ---
-    # For each (rotors, reflector, fourth), sweep positions.
-    # Use the superposition solver to reject inconsistent trajectories FAST,
-    # then beam swap on survivors.
-    from enigma.superposition import try_collapse
+    # --- Zero knowledge: use hierarchical phase-space solver ---
+    if not known_rotors and not known_pos:
+        # Collect same-day messages for cross-validation
+        same_day = [ct]
+        if msg.date:
+            for other in MESSAGES:
+                if other.id != msg.id and other.date == msg.date:
+                    other_ct = "".join(c for c in other.ciphertext if "A" <= c <= "Z")
+                    if len(other_ct) >= 20:
+                        same_day.append(other_ct)
 
-    best_score = float("-inf")
-    best_result = None
-    configs_tried = 0
-    configs_survived = 0
+        results = crack_zero_knowledge(
+            same_day,
+            model=model,
+            rotor_pool=rotor_pool,
+            reflector_names=tuple(reflectors),
+            beam_rounds=10,
+            beam_width=50,
+            search_rings=True,
+            time_limit=time_limit,
+            progress=True,
+            fourth_rotors=fourth_rotors,
+            fourth_positions=fourth_positions,
+        )
+        if not results:
+            return None
+        return _from_pipeline_result(results[0])
 
-    for refl in reflectors:
-        for rotors in rotor_combos:
-            for fourth_name, fourth_pos in fourth_configs:
-                fourth_kw = {}
-                if fourth_name:
-                    fourth_kw = dict(fourth_rotor_name=fourth_name,
-                                    fourth_position=fourth_pos, fourth_ring=0)
+    # --- Partial knowledge: use full pipeline ---
+    results = crack_full(
+        ct,
+        model=model,
+        rotor_pool=rotor_pool,
+        reflector_names=tuple(reflectors),
+        ring_settings=rings,
+        known_rotors=known_rotors,
+        known_positions=known_pos,
+        ic_survivors=200,
+        superposition_filter=True,
+        domain_cascade=False,
+        beam_rounds=5,
+        beam_width=30,
+        time_limit=time_limit,
+        fourth_rotors=fourth_rotors,
+        fourth_positions=fourth_positions,
+    )
 
-                positions = [known_pos] if position_known else None
-
-                # If position unknown: IC pre-filter to top 200
-                if positions is None:
-                    ic_scores = []
-                    for pl in range(26):
-                        for pm in range(26):
-                            for pr in range(26):
-                                traj = fast_trajectory(rotors, refl, (pl, pm, pr), rings, L, **fourth_kw)
-                                dec = [traj[t][cipher[t]] for t in range(L)]
-                                ic_scores.append((index_of_coincidence(dec), (pl, pm, pr)))
-                                if time.time() - t0 > time_limit:
-                                    break
-                            if time.time() - t0 > time_limit:
-                                break
-                        if time.time() - t0 > time_limit:
-                            break
-                    ic_scores.sort(reverse=True)
-                    positions = [pos for _, pos in ic_scores[:200]]
-
-                for pos in positions:
-                    if time.time() - t0 > time_limit:
-                        break
-
-                    traj = fast_trajectory(rotors, refl, pos, rings, L, **fourth_kw)
-                    configs_tried += 1
-
-                    # Superposition pre-filter: try common seed letters,
-                    # reject if none survive.
-                    rejected = True
-                    for seed in (4, 13, 8, 18, 0):  # E N I S A
-                        if seed == cipher[0]:
-                            continue
-                        result = try_collapse(cipher, traj, model, seed, 0)
-                        if result.consistent:
-                            rejected = False
-                            break
-                    if rejected:
-                        continue
-                    configs_survived += 1
-
-                    # Beam swap with adaptive rounds
-                    n_rounds = 10 if total_combos <= 10 else 3
-                    beam = 50 if total_combos <= 10 else 20
-                    score, plug, dec = beam_swap_search(
-                        cipher, traj, model, rounds=n_rounds, beam_width=beam,
-                    )
-
-                    if score > best_score:
-                        best_score = score
-                        best_result = _result(
-                            rotors, refl, pos, rings, plug, dec, score,
-                            fourth_name, fourth_pos, 0, configs_tried,
-                        )
-
-                if time.time() - t0 > time_limit:
-                    break
-            if time.time() - t0 > time_limit:
-                break
-        if time.time() - t0 > time_limit:
-            break
-
-    if best_result:
-        best_result["elapsed"] = time.time() - t0
-        best_result["configs_tried"] = configs_tried
-        best_result["configs_survived"] = configs_survived
-    return best_result
+    if not results:
+        return None
+    return _from_pipeline_result(results[0])
 
 
-def _result(rotors, refl, pos, rings, plug, dec, score,
-            fourth_name=None, fourth_pos=0, elapsed=0, tried=0):
+def _from_pipeline_result(r: PipelineResult) -> dict:
     return {
-        "rotors": rotors, "reflector": refl, "positions": pos,
-        "rings": rings, "plug_map": plug,
-        "plaintext": "".join(chr(d + 65) for d in dec),
-        "score": score,
-        "pairs": [(a, plug[a]) for a in range(26) if plug[a] > a],
-        "fourth_rotor": fourth_name, "fourth_position": fourth_pos,
-        "elapsed": elapsed, "configs_tried": tried,
+        "rotors": r.rotor_names, "reflector": r.reflector_name,
+        "positions": r.positions, "rings": r.ring_settings,
+        "plug_map": r.plugboard_map,
+        "plaintext": r.plaintext,
+        "score": r.score,
+        "pairs": r.plugboard_pairs,
+        "fourth_rotor": r.fourth_rotor_name,
+        "fourth_position": r.fourth_position,
+        "elapsed": r.elapsed,
+        "configs_tried": 0,
+        "configs_survived": 0,
+        "stages_used": r.stages_used,
+        "n_excluded_bigrams": r.n_excluded_bigrams,
     }
 
 

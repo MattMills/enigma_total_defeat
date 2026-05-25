@@ -23,6 +23,12 @@ from enigma.solver import (
     crt,
     crt_multi,
 )
+from enigma.pipeline import (
+    PipelineResult,
+    crack_full,
+    crack_with_known_trajectory,
+    crack_zero_knowledge,
+)
 
 __all__ = [
     "Enigma",
@@ -46,4 +52,8 @@ __all__ = [
     "progressive_solve",
     "crt",
     "crt_multi",
+    "PipelineResult",
+    "crack_full",
+    "crack_with_known_trajectory",
+    "crack_zero_knowledge",
 ]
