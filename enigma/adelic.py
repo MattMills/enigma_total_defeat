@@ -332,31 +332,91 @@ def run_adelic(
             for m in all_manifolds
         }
 
-        # === COHERENCE-DRIVEN RANDOM SAMPLING ===
-        # Each manifold samples based on ITS OWN entropy:
-        #   High entropy (uncertain) → uniform random across full range
-        #   Low entropy (certain) → concentrated near current best
-        # Once ANY manifold catches signal, it narrows, constraining
-        # the samples for all others → cascade toward solution.
+        # === DUAL COHERENCE: random samples + structured probes ===
+        # Signal 1 (full coherence): bigram/trigram validity — needs all 5D correct
+        # Signal 2 (structural probes): patterned samples that fire on PARTIAL alignment
+        #   - Period-26 probes: test each combo's rotor fingerprint
+        #   - IC probes: plugboard-invariant, responds to 3D (combo+pos) alone
+        #   - Differential probes: test rotor step patterns in ciphertext
+        # The structural probes break the 5D coupling by providing per-dimension evidence.
         import random
 
-        N_SAMPLES = 2000
+        N_RANDOM = 500   # random samples for full coherence
         samples: list[tuple[int, int, int, int, int, float]] = []
 
         def _sample_manifold(m: Manifold) -> int:
-            """Sample from manifold: width proportional to entropy."""
             ent = m.entropy()
             max_ent = math.log(m.size)
-            # ratio: 1.0 = fully uncertain (uniform), 0.0 = fully certain
             ratio = min(ent / max_ent, 1.0) if max_ent > 0 else 1.0
             if ratio > 0.7:
-                # High uncertainty: uniform random
                 return random.randint(0, m.size - 1)
             else:
-                # Low uncertainty: sample from belief distribution
                 return random.choices(range(m.size), weights=m.belief)[0]
 
-        for _ in range(N_SAMPLES):
+        # --- Signal 2: STRUCTURAL PROBES (per-dimension, don't need all 5D) ---
+        # For each combo: compute IC at sampled positions (IC is plugboard-invariant,
+        # responds to combo+position being correct even with wrong ring/plug)
+        combo_structural_ev = [0.0] * len(all_combos)
+        for ci_test in range(len(all_combos)):
+            c_test = all_combos[ci_test]
+            best_ic = 0.0
+            # Sample positions for this combo (entropy-driven width)
+            for _ in range(20):
+                pl_s = _sample_manifold(m_pos_L)
+                pm_s = _sample_manifold(m_pos_M)
+                pr_s = _sample_manifold(m_pos_R)
+                rr_s = _sample_manifold(m_ring_R)
+                t2 = fast_trajectory(c_test, refl, (pl_s, pm_s, pr_s), (0, rM, rr_s), L)
+                dec = [t2[t][cipher[t]] for t in range(L)]
+                ic = index_of_coincidence(dec)
+                if ic > best_ic:
+                    best_ic = ic
+            combo_structural_ev[ci_test] = best_ic * 1000
+
+        # pos_R structural: for best combo, IC across pos_R values
+        # (fixes combo, sweeps pos_R with random pos_M/pos_L — IC still responds)
+        pos_r_structural_ev = [0.0] * 26
+        best_combo_idx = max(range(len(all_combos)), key=lambda i: combo_structural_ev[i])
+        c_best = all_combos[best_combo_idx]
+        for pr_test in range(26):
+            best_ic = 0.0
+            for _ in range(8):
+                pl_s = _sample_manifold(m_pos_L)
+                pm_s = _sample_manifold(m_pos_M)
+                rr_s = _sample_manifold(m_ring_R)
+                t2 = fast_trajectory(c_best, refl, (pl_s, pm_s, pr_test), (0, rM, rr_s), L)
+                dec = [t2[t][cipher[t]] for t in range(L)]
+                ic = index_of_coincidence(dec)
+                if ic > best_ic:
+                    best_ic = ic
+            pos_r_structural_ev[pr_test] = best_ic * 1000
+
+        # pos_M structural
+        pos_m_structural_ev = [0.0] * 26
+        best_pr = max(range(26), key=lambda i: pos_r_structural_ev[i])
+        for pm_test in range(26):
+            best_ic = 0.0
+            for _ in range(8):
+                pl_s = _sample_manifold(m_pos_L)
+                rr_s = _sample_manifold(m_ring_R)
+                t2 = fast_trajectory(c_best, refl, (pl_s, pm_test, best_pr), (0, rM, rr_s), L)
+                dec = [t2[t][cipher[t]] for t in range(L)]
+                ic = index_of_coincidence(dec)
+                if ic > best_ic:
+                    best_ic = ic
+            pos_m_structural_ev[pm_test] = best_ic * 1000
+
+        # pos_L structural
+        pos_l_structural_ev = [0.0] * 26
+        best_pm = max(range(26), key=lambda i: pos_m_structural_ev[i])
+        for pl_test in range(26):
+            rr_s = _sample_manifold(m_ring_R)
+            t2 = fast_trajectory(c_best, refl, (pl_test, best_pm, best_pr), (0, rM, rr_s), L)
+            dec = [t2[t][cipher[t]] for t in range(L)]
+            pos_l_structural_ev[pl_test] = index_of_coincidence(dec) * 1000
+
+        # --- Signal 1: RANDOM SAMPLES for full coherence ---
+        for _ in range(N_RANDOM):
             ci_s = _sample_manifold(m_combo)
             pl_s = _sample_manifold(m_pos_L)
             pm_s = _sample_manifold(m_pos_M)
@@ -369,43 +429,52 @@ def run_adelic(
             coh = total_coherence(sigs)
             samples.append((ci_s, pl_s, pm_s, pr_s, rr_s, coh))
 
-        # Update EVERY manifold from ALL samples simultaneously.
-        # Each manifold SUMS coherence for each of its values across all
-        # samples that used that value. This accumulates signal over many
-        # samples — values that consistently produce higher coherence
-        # build up more evidence even if no single sample hits the peak.
+        # === COMBINE both signals: structural probes + random coherence ===
+        # Structural (Signal 2) provides per-dimension evidence (partial alignment)
+        # Random (Signal 1) provides full-coherence evidence (all-dimension alignment)
+        # Weight structural more when entropy is high (exploring),
+        # weight random more when entropy is low (exploiting).
 
-        combo_ev = [0.0] * len(all_combos)
+        struct_weight = sum(m.entropy() for m in [m_combo, m_pos_R, m_pos_M, m_pos_L]) / (4 * math.log(26))
+        rand_weight = 1.0 - struct_weight
+
+        # Random coherence: accumulate from samples
+        combo_rand = [0.0] * len(all_combos)
         combo_counts = [0] * len(all_combos)
-        pos_r_ev = [0.0] * 26
+        pos_r_rand = [0.0] * 26
         pos_r_counts = [0] * 26
-        pos_m_ev = [0.0] * 26
+        pos_m_rand = [0.0] * 26
         pos_m_counts = [0] * 26
-        pos_l_ev = [0.0] * 26
+        pos_l_rand = [0.0] * 26
         pos_l_counts = [0] * 26
-        ring_r_ev = [0.0] * 26
+        ring_r_rand = [0.0] * 26
         ring_r_counts = [0] * 26
 
         for ci_s, pl_s, pm_s, pr_s, rr_s, coh in samples:
-            combo_ev[ci_s] += coh
-            combo_counts[ci_s] += 1
-            pos_r_ev[pr_s] += coh
-            pos_r_counts[pr_s] += 1
-            pos_m_ev[pm_s] += coh
-            pos_m_counts[pm_s] += 1
-            pos_l_ev[pl_s] += coh
-            pos_l_counts[pl_s] += 1
-            ring_r_ev[rr_s] += coh
-            ring_r_counts[rr_s] += 1
+            combo_rand[ci_s] += coh; combo_counts[ci_s] += 1
+            pos_r_rand[pr_s] += coh; pos_r_counts[pr_s] += 1
+            pos_m_rand[pm_s] += coh; pos_m_counts[pm_s] += 1
+            pos_l_rand[pl_s] += coh; pos_l_counts[pl_s] += 1
+            ring_r_rand[rr_s] += coh; ring_r_counts[rr_s] += 1
 
-        # Average (not sum) to normalize for unequal sample counts
-        combo_ev = [combo_ev[i] / max(combo_counts[i], 1) for i in range(len(all_combos))]
-        pos_r_ev = [pos_r_ev[i] / max(pos_r_counts[i], 1) for i in range(26)]
-        pos_m_ev = [pos_m_ev[i] / max(pos_m_counts[i], 1) for i in range(26)]
-        pos_l_ev = [pos_l_ev[i] / max(pos_l_counts[i], 1) for i in range(26)]
-        ring_r_ev = [ring_r_ev[i] / max(ring_r_counts[i], 1) for i in range(26)]
+        combo_rand = [combo_rand[i] / max(combo_counts[i], 1) for i in range(len(all_combos))]
+        pos_r_rand = [pos_r_rand[i] / max(pos_r_counts[i], 1) for i in range(26)]
+        pos_m_rand = [pos_m_rand[i] / max(pos_m_counts[i], 1) for i in range(26)]
+        pos_l_rand = [pos_l_rand[i] / max(pos_l_counts[i], 1) for i in range(26)]
+        ring_r_rand = [ring_r_rand[i] / max(ring_r_counts[i], 1) for i in range(26)]
 
-        # Pass through Gold code interference (adds cross-manifold signal)
+        # Blend: structural × struct_weight + random × rand_weight
+        combo_ev = [struct_weight * combo_structural_ev[i] + rand_weight * combo_rand[i]
+                    for i in range(len(all_combos))]
+        pos_r_ev = [struct_weight * pos_r_structural_ev[i] + rand_weight * pos_r_rand[i]
+                    for i in range(26)]
+        pos_m_ev = [struct_weight * pos_m_structural_ev[i] + rand_weight * pos_m_rand[i]
+                    for i in range(26)]
+        pos_l_ev = [struct_weight * pos_l_structural_ev[i] + rand_weight * pos_l_rand[i]
+                    for i in range(26)]
+        ring_r_ev = [rand_weight * ring_r_rand[i] for i in range(26)]
+
+        # Gold code interference
         combo_ev = parallel_evaluate(combo_ev)
         pos_r_ev = parallel_evaluate(pos_r_ev)
         pos_m_ev = parallel_evaluate(pos_m_ev)
