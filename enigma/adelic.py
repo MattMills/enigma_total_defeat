@@ -543,61 +543,9 @@ def run_adelic(
         rM = m_ring_M.best()
         ring = (0, rM, rR)
 
-        # === Update plug manifolds (per-position coherence) ===
-        rM = m_ring_M.best()
-        ring = (0, rM, rR)
-        traj = fast_trajectory(combo, refl, pos, ring, L)
-
-        # Build 26×26 plug score matrix from per-position coherence
-        plug_matrix = [[0.0] * 26 for _ in range(26)]
-        for a in range(26):
-            for b in range(26):
-                # Test: if P(a)=b (and P(b)=a by involution)
-                test_plug = list(plug_map)
-                test_plug[a] = b
-                test_plug[b] = a
-                # Undo old mappings that conflict
-                old_a = plug_map[a]
-                old_b = plug_map[b]
-                if old_a != a and old_a != b:
-                    test_plug[old_a] = old_a
-                if old_b != b and old_b != a and old_b != old_a:
-                    test_plug[old_b] = old_b
-                sigs = compute_position_signals(cipher, traj, test_plug)
-                plug_matrix[a][b] = total_coherence(sigs)
-
-        # Symmetrize (involution)
-        for a in range(26):
-            for b in range(a + 1, 26):
-                avg = (plug_matrix[a][b] + plug_matrix[b][a]) / 2
-                plug_matrix[a][b] = avg
-                plug_matrix[b][a] = avg
-
-        # Temperature + Sinkhorn → doubly-stochastic
-        max_m = max(plug_matrix[a][b] for a in range(26) for b in range(26))
-        for a in range(26):
-            for b in range(26):
-                plug_matrix[a][b] = math.exp((plug_matrix[a][b] - max_m) / max(T, 0.01))
-        for _ in range(15):
-            for a in range(26):
-                rs = sum(plug_matrix[a]) or 1e-12
-                plug_matrix[a] = [v / rs for v in plug_matrix[a]]
-            for b in range(26):
-                cs = sum(plug_matrix[a][b] for a in range(26)) or 1e-12
-                for a in range(26):
-                    plug_matrix[a][b] /= cs
-
-        # Update plug manifold beliefs from Sinkhorn result
-        for a in range(26):
-            m_plug[a].belief = list(plug_matrix[a])
-            total = sum(m_plug[a].belief) or 1e-12
-            m_plug[a].belief = [v / total for v in m_plug[a].belief]
-
-        # Update plug_map for display
-        plug_map = [m_plug[a].best() for a in range(26)]
+        # Plugboard: DERIVED (not searched). Done at end via beam_swap.
 
         if progress and cycle % 3 == 0:
-            n_pairs = sum(1 for a in range(26) if plug_map[a] > a)
             combo = all_combos[m_combo.best()]
             refl = reflector_pool[m_refl.best()]
             pos = (m_pos_L.best(), m_pos_M.best(), m_pos_R.best())
@@ -607,7 +555,7 @@ def run_adelic(
                   f"{'-'.join(combo)}/{refl} "
                   f"pos={''.join(chr(p+65) for p in pos)} "
                   f"ring={''.join(chr(r+65) for r in ring)} "
-                  f"pairs={n_pairs} coh={current_coherence:.0f} "
+                  f"coh={current_coherence:.0f} "
                   f"H_struct={struct_ent:.1f}")
 
     # === Final reconstruction ===
@@ -615,9 +563,7 @@ def run_adelic(
     refl = reflector_pool[m_refl.best()]
     pos = (m_pos_L.best(), m_pos_M.best(), m_pos_R.best())
     ring = (0, m_ring_M.best(), m_ring_R.best())
-    plug_map = [m_plug[a].best() for a in range(26)]
-
-    # Final beam swap polish on the recovered trajectory
+    # Plugboard derived via beam swap on the recovered trajectory
     from enigma.attack import beam_swap_search
     traj = fast_trajectory(combo, refl, pos, ring, L)
     score, final_plug, dec = beam_swap_search(cipher, traj, model, rounds=10, beam_width=50)
