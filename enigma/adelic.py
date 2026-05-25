@@ -72,6 +72,43 @@ def _generate_gold_family(n: int = 5) -> list[list[int]]:
 GOLD_CODES = _generate_gold_family(5)
 GOLD_LEN = 31
 
+# Layer 2: Value codes (for parallel evaluation of all residues simultaneously)
+# Use a different preferred pair to get an independent family
+def _generate_gold_family_2(n: int = 5) -> list[list[int]]:
+    length = (1 << n) - 1
+    seq1 = _lfsr([0, 3], 1, n, length)  # different taps
+    seq2 = _lfsr([0, 2, 3, 4], 1, n, length)
+    family = [seq1, seq2]
+    for shift in range(length):
+        gold = [seq1[i] * seq2[(i + shift) % length] for i in range(length)]
+        family.append(gold)
+    return family[:33]
+
+VALUE_CODES = _generate_gold_family_2(5)
+
+
+def parallel_evaluate(scores: list[float]) -> list[float]:
+    """Spread N scores with value codes, extract via correlation.
+
+    Input: scores[i] = evidence for value i
+    Output: recovered[i] = correlation-extracted score for value i
+    (Includes diagonal interference from other values)
+    """
+    n = len(scores)
+    # Spread into shared space
+    shared = [0.0] * GOLD_LEN
+    for val in range(n):
+        code = VALUE_CODES[val % 33]
+        for chip in range(GOLD_LEN):
+            shared[chip] += scores[val] * code[chip]
+    # Extract each value
+    recovered = []
+    for val in range(n):
+        code = VALUE_CODES[val % 33]
+        corr = sum(shared[i] * code[i] for i in range(GOLD_LEN)) / GOLD_LEN
+        recovered.append(corr)
+    return recovered
+
 
 # ------------------------------------------------------------------
 # Per-position signal encoding
@@ -295,82 +332,111 @@ def run_adelic(
             for m in all_manifolds
         }
 
-        # === Update structural manifolds ===
-        # Each tested by: swap this manifold's value, recompute coherence
+        # === JOINT evaluation: combo × pos_R × pos_M × pos_L ===
+        # Sweep ALL dimensions. Since full 60×26³ is too large,
+        # do: for each combo, sweep (pos_L × pos_M × pos_R) and record
+        # best coherence per combo AND best position per combo.
+        # This is 60 × 26 × 26 × 26 = ~1M evals. Too slow.
+        #
+        # INSTEAD: hierarchical. Sweep pos_R for all combos (60×26=1560),
+        # then for top combos sweep pos_M (5×26=130),
+        # then for best sweep pos_L (1×26=26).
+        # Total: ~1716 evals per cycle.
 
-        # Combo: test top candidates (expensive, so limit)
-        combo_ev = [0.0] * len(all_combos)
-        # Sample positions to avoid lock-in
-        pos_samples = [pos]
-        for pr_s in range(0, 26, 6):
-            pos_samples.append((pL, pM, pr_s))
+        # Stage A: sweep combo × pos_R (fix pos_M, pos_L at current)
+        joint_cr: dict[tuple[int, int], float] = {}
         for ci_test in range(len(all_combos)):
             c_test = all_combos[ci_test]
-            best_coh = 0.0
-            for p_s in pos_samples[:6]:
-                t2 = fast_trajectory(c_test, refl, p_s, ring, L)
+            for pr_test in range(26):
+                t2 = fast_trajectory(c_test, refl, (pL, pM, pr_test), ring, L)
                 sigs = compute_position_signals(cipher, t2, plug_map)
-                coh = total_coherence(sigs)
-                if coh > best_coh:
-                    best_coh = coh
-            combo_ev[ci_test] = best_coh + manifold_interference["combo"] * 0.1
+                joint_cr[(ci_test, pr_test)] = total_coherence(sigs)
+
+        # Combo evidence = max over pos_R
+        combo_ev = [max(joint_cr[(ci_t, pr)] for pr in range(26))
+                    for ci_t in range(len(all_combos))]
+        combo_ev = parallel_evaluate(combo_ev)
         m_combo.accumulate(combo_ev, T)
+        ci = m_combo.best()
+        combo = all_combos[ci]
 
-        # Reflector
-        refl_ev = [0.0] * len(reflector_pool)
-        combo = all_combos[m_combo.best()]
-        for ri_test in range(len(reflector_pool)):
-            t2 = fast_trajectory(combo, reflector_pool[ri_test], pos, ring, L)
-            sigs = compute_position_signals(cipher, t2, plug_map)
-            refl_ev[ri_test] = total_coherence(sigs)
-        m_refl.accumulate(refl_ev, T)
-        refl = reflector_pool[m_refl.best()]
-
-        # Position R: test each of 26 values
-        pos_r_ev = [0.0] * 26
-        for pr_test in range(26):
-            t2 = fast_trajectory(combo, refl, (pL, pM, pr_test), ring, L)
-            sigs = compute_position_signals(cipher, t2, plug_map)
-            pos_r_ev[pr_test] = total_coherence(sigs)
-        pos_r_ev = [e + manifold_interference["pos_R"] * 0.1 for e in pos_r_ev]
+        # pos_R evidence = score at best combo
+        pos_r_ev = [joint_cr[(ci, pr)] for pr in range(26)]
+        pos_r_ev = parallel_evaluate(pos_r_ev)
         m_pos_R.accumulate(pos_r_ev, T)
-
-        # Position M
         pR = m_pos_R.best()
+
+        # Stage B: sweep pos_M with locked (combo, pos_R)
         pos_m_ev = [0.0] * 26
         for pm_test in range(26):
             t2 = fast_trajectory(combo, refl, (pL, pm_test, pR), ring, L)
             sigs = compute_position_signals(cipher, t2, plug_map)
             pos_m_ev[pm_test] = total_coherence(sigs)
+        pos_m_ev = parallel_evaluate(pos_m_ev)
         m_pos_M.accumulate(pos_m_ev, T)
-
-        # Position L
         pM = m_pos_M.best()
+
+        # Stage C: sweep pos_L with locked (combo, pos_R, pos_M)
         pos_l_ev = [0.0] * 26
         for pl_test in range(26):
             t2 = fast_trajectory(combo, refl, (pl_test, pM, pR), ring, L)
             sigs = compute_position_signals(cipher, t2, plug_map)
             pos_l_ev[pl_test] = total_coherence(sigs)
+        pos_l_ev = parallel_evaluate(pos_l_ev)
         m_pos_L.accumulate(pos_l_ev, T)
-
-        # Ring R
         pL = m_pos_L.best()
         pos = (pL, pM, pR)
+
+        # Reflector: use best (combo, pos_R) from joint
+        refl_ev = [0.0] * len(reflector_pool)
+        for ri_test in range(len(reflector_pool)):
+            t2 = fast_trajectory(combo, reflector_pool[ri_test], (pL, pM, pR), ring, L)
+            sigs = compute_position_signals(cipher, t2, plug_map)
+            refl_ev[ri_test] = total_coherence(sigs)
+        m_refl.accumulate(refl_ev, T)
+        refl = reflector_pool[m_refl.best()]
+
+        # Position M: sweep with best combo and pos_R locked
+        pos_m_ev = [0.0] * 26
+        for pm_test in range(26):
+            t2 = fast_trajectory(combo, refl, (pL, pm_test, pR), ring, L)
+            sigs = compute_position_signals(cipher, t2, plug_map)
+            pos_m_ev[pm_test] = total_coherence(sigs)
+        pos_m_ev = parallel_evaluate(pos_m_ev)
+        m_pos_M.accumulate(pos_m_ev, T)
+        pM = m_pos_M.best()
+
+        # Position L: sweep with best combo, pos_R, pos_M locked
+        pos_l_ev = [0.0] * 26
+        for pl_test in range(26):
+            t2 = fast_trajectory(combo, refl, (pl_test, pM, pR), ring, L)
+            sigs = compute_position_signals(cipher, t2, plug_map)
+            pos_l_ev[pl_test] = total_coherence(sigs)
+        pos_l_ev = parallel_evaluate(pos_l_ev)
+        m_pos_L.accumulate(pos_l_ev, T)
+        pL = m_pos_L.best()
+        pos = (pL, pM, pR)
+
+        # Ring R: sweep
         ring_r_ev = [0.0] * 26
         for rr_test in range(26):
             t2 = fast_trajectory(combo, refl, pos, (0, rM, rr_test), L)
             sigs = compute_position_signals(cipher, t2, plug_map)
             ring_r_ev[rr_test] = total_coherence(sigs)
+        ring_r_ev = parallel_evaluate(ring_r_ev)
         m_ring_R.accumulate(ring_r_ev, T)
-
-        # Ring M
         rR = m_ring_R.best()
+
+        # Ring M: sweep
         ring_m_ev = [0.0] * 26
         for rm_test in range(26):
             t2 = fast_trajectory(combo, refl, pos, (0, rm_test, rR), L)
             sigs = compute_position_signals(cipher, t2, plug_map)
             ring_m_ev[rm_test] = total_coherence(sigs)
+        ring_m_ev = parallel_evaluate(ring_m_ev)
         m_ring_M.accumulate(ring_m_ev, T)
+        rM = m_ring_M.best()
+        ring = (0, rM, rR)
 
         # === Update plug manifolds (per-position coherence) ===
         rM = m_ring_M.best()
