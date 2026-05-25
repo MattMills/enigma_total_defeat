@@ -332,60 +332,100 @@ def run_adelic(
             for m in all_manifolds
         }
 
-        # === JOINT evaluation: combo × pos_R × pos_M × pos_L ===
-        # Sweep ALL dimensions. Since full 60×26³ is too large,
-        # do: for each combo, sweep (pos_L × pos_M × pos_R) and record
-        # best coherence per combo AND best position per combo.
-        # This is 60 × 26 × 26 × 26 = ~1M evals. Too slow.
-        #
-        # INSTEAD: hierarchical. Sweep pos_R for all combos (60×26=1560),
-        # then for top combos sweep pos_M (5×26=130),
-        # then for best sweep pos_L (1×26=26).
-        # Total: ~1716 evals per cycle.
+        # === COHERENCE-DRIVEN RANDOM SAMPLING ===
+        # Each manifold samples based on ITS OWN entropy:
+        #   High entropy (uncertain) → uniform random across full range
+        #   Low entropy (certain) → concentrated near current best
+        # Once ANY manifold catches signal, it narrows, constraining
+        # the samples for all others → cascade toward solution.
+        import random
 
-        # Stage A: sweep combo × pos_R (fix pos_M, pos_L at current)
-        joint_cr: dict[tuple[int, int], float] = {}
-        for ci_test in range(len(all_combos)):
-            c_test = all_combos[ci_test]
-            for pr_test in range(26):
-                t2 = fast_trajectory(c_test, refl, (pL, pM, pr_test), ring, L)
-                sigs = compute_position_signals(cipher, t2, plug_map)
-                joint_cr[(ci_test, pr_test)] = total_coherence(sigs)
+        N_SAMPLES = 2000
+        samples: list[tuple[int, int, int, int, int, float]] = []
 
-        # Combo evidence = max over pos_R
-        combo_ev = [max(joint_cr[(ci_t, pr)] for pr in range(26))
-                    for ci_t in range(len(all_combos))]
-        combo_ev = parallel_evaluate(combo_ev)
-        m_combo.accumulate(combo_ev, T)
-        ci = m_combo.best()
-        combo = all_combos[ci]
+        def _sample_manifold(m: Manifold) -> int:
+            """Sample from manifold: width proportional to entropy."""
+            ent = m.entropy()
+            max_ent = math.log(m.size)
+            # ratio: 1.0 = fully uncertain (uniform), 0.0 = fully certain
+            ratio = min(ent / max_ent, 1.0) if max_ent > 0 else 1.0
+            if ratio > 0.7:
+                # High uncertainty: uniform random
+                return random.randint(0, m.size - 1)
+            else:
+                # Low uncertainty: sample from belief distribution
+                return random.choices(range(m.size), weights=m.belief)[0]
 
-        # pos_R evidence = score at best combo
-        pos_r_ev = [joint_cr[(ci, pr)] for pr in range(26)]
-        pos_r_ev = parallel_evaluate(pos_r_ev)
-        m_pos_R.accumulate(pos_r_ev, T)
-        pR = m_pos_R.best()
+        for _ in range(N_SAMPLES):
+            ci_s = _sample_manifold(m_combo)
+            pl_s = _sample_manifold(m_pos_L)
+            pm_s = _sample_manifold(m_pos_M)
+            pr_s = _sample_manifold(m_pos_R)
+            rr_s = _sample_manifold(m_ring_R)
 
-        # Stage B: sweep pos_M with locked (combo, pos_R)
+            c_s = all_combos[ci_s]
+            t2 = fast_trajectory(c_s, refl, (pl_s, pm_s, pr_s), (0, rM, rr_s), L)
+            sigs = compute_position_signals(cipher, t2, plug_map)
+            coh = total_coherence(sigs)
+            samples.append((ci_s, pl_s, pm_s, pr_s, rr_s, coh))
+
+        # Update EVERY manifold from ALL samples simultaneously.
+        # Each manifold SUMS coherence for each of its values across all
+        # samples that used that value. This accumulates signal over many
+        # samples — values that consistently produce higher coherence
+        # build up more evidence even if no single sample hits the peak.
+
+        combo_ev = [0.0] * len(all_combos)
+        combo_counts = [0] * len(all_combos)
+        pos_r_ev = [0.0] * 26
+        pos_r_counts = [0] * 26
         pos_m_ev = [0.0] * 26
-        for pm_test in range(26):
-            t2 = fast_trajectory(combo, refl, (pL, pm_test, pR), ring, L)
-            sigs = compute_position_signals(cipher, t2, plug_map)
-            pos_m_ev[pm_test] = total_coherence(sigs)
-        pos_m_ev = parallel_evaluate(pos_m_ev)
-        m_pos_M.accumulate(pos_m_ev, T)
-        pM = m_pos_M.best()
-
-        # Stage C: sweep pos_L with locked (combo, pos_R, pos_M)
+        pos_m_counts = [0] * 26
         pos_l_ev = [0.0] * 26
-        for pl_test in range(26):
-            t2 = fast_trajectory(combo, refl, (pl_test, pM, pR), ring, L)
-            sigs = compute_position_signals(cipher, t2, plug_map)
-            pos_l_ev[pl_test] = total_coherence(sigs)
+        pos_l_counts = [0] * 26
+        ring_r_ev = [0.0] * 26
+        ring_r_counts = [0] * 26
+
+        for ci_s, pl_s, pm_s, pr_s, rr_s, coh in samples:
+            combo_ev[ci_s] += coh
+            combo_counts[ci_s] += 1
+            pos_r_ev[pr_s] += coh
+            pos_r_counts[pr_s] += 1
+            pos_m_ev[pm_s] += coh
+            pos_m_counts[pm_s] += 1
+            pos_l_ev[pl_s] += coh
+            pos_l_counts[pl_s] += 1
+            ring_r_ev[rr_s] += coh
+            ring_r_counts[rr_s] += 1
+
+        # Average (not sum) to normalize for unequal sample counts
+        combo_ev = [combo_ev[i] / max(combo_counts[i], 1) for i in range(len(all_combos))]
+        pos_r_ev = [pos_r_ev[i] / max(pos_r_counts[i], 1) for i in range(26)]
+        pos_m_ev = [pos_m_ev[i] / max(pos_m_counts[i], 1) for i in range(26)]
+        pos_l_ev = [pos_l_ev[i] / max(pos_l_counts[i], 1) for i in range(26)]
+        ring_r_ev = [ring_r_ev[i] / max(ring_r_counts[i], 1) for i in range(26)]
+
+        # Pass through Gold code interference (adds cross-manifold signal)
+        combo_ev = parallel_evaluate(combo_ev)
+        pos_r_ev = parallel_evaluate(pos_r_ev)
+        pos_m_ev = parallel_evaluate(pos_m_ev)
         pos_l_ev = parallel_evaluate(pos_l_ev)
+        ring_r_ev = parallel_evaluate(ring_r_ev)
+
+        # Update all structural manifolds
+        m_combo.accumulate(combo_ev, T)
+        m_pos_R.accumulate(pos_r_ev, T)
+        m_pos_M.accumulate(pos_m_ev, T)
         m_pos_L.accumulate(pos_l_ev, T)
+        m_ring_R.accumulate(ring_r_ev, T)
+
+        combo = all_combos[m_combo.best()]
+        pR = m_pos_R.best()
+        pM = m_pos_M.best()
         pL = m_pos_L.best()
+        rR = m_ring_R.best()
         pos = (pL, pM, pR)
+        ring = (0, rM, rR)
 
         # Reflector: use best (combo, pos_R) from joint
         refl_ev = [0.0] * len(reflector_pool)
