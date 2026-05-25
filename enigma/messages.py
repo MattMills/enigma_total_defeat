@@ -157,14 +157,20 @@ _add(EnigmaMessage(
     date="1942-11-25",
     source="M4 Project (Stefan Krah, 2006) — Scharnhorst intercept",
     reflector="B-thin",
-    rotors=("II", "IV", "V"),
+    rotors=("II", "IV", "I"),
     ring_settings="AAV",
     initial_positions="JNA",
     plugboard="AT BL DF GJ HM NW OP QY RZ VX",
     fourth_rotor="Beta",
     fourth_position="V",
-    known_plaintext="",
-    notes="First M4 message cracked by distributed computing; ciphertext may include indicator prefix — settings unverified against this transcription",
+    known_plaintext=(
+        "VONVONJLOOKSJHFFTTTEINSEINSDREIZWOYYQNNSNEUNINHALTXX"
+        "BEIANGRIFFUNTERWASSERGEDRUECKTYWABOSXLETZTERGEGNERST"
+        "ANDNULACHTDREINULUHRMARQUANTONJOTANEUNACHTSEYHSDREIY"
+        "ZWOZWONULGRADYACHTSMYSTOSSENACHXEKNSVIERMBFAELLTYNNN"
+        "NNNOOOVIERYSICHTEINSNULL"
+    ),
+    notes="M4 Project Message 1 (Looks message), cracked 2006. Rotors Beta-II-IV-I (not V)",
 ))
 
 # ====================================================================
@@ -223,7 +229,7 @@ _add(EnigmaMessage(
     initial_positions="VJA",
     plugboard="AT BL DF GJ HM NW OP QY RZ VX",
     known_plaintext="",
-    notes="Donitz U-boat command dispatch; ciphertext transcription unverified",
+    notes="Donitz U-boat command dispatch; rotor order unverified — may not be II-IV-V",
 ))
 
 # ====================================================================
