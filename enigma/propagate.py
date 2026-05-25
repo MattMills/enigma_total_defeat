@@ -274,3 +274,130 @@ class SignedPropagator:
             f"plug_det={self.n_determined_plug()}/26 "
             f"avg_candidates={sum(len(s) for s in self.positive)/self.L:.1f}"
         )
+
+
+# ------------------------------------------------------------------
+# Interleaved branch-and-prune: only branch at "free" positions
+# ------------------------------------------------------------------
+
+
+def branch_and_prune(
+    cipher: list[int],
+    trajectory: list[list[int]],
+    model: LanguageModel,
+    beam_width: int = 500,
+) -> list[tuple[float, dict[int, int], list[int]]]:
+    """Recover plugboard by branching only at free positions.
+
+    Each position touches 4 letters in the plugboard. After ~8
+    positions, most letters are touched and subsequent positions
+    have x DETERMINED (no branching needed — just check consistency).
+    Only ~5 of 174 positions actually need branching on x.
+
+    A "state" is (plugboard_dict, plaintext_so_far, score).
+    At free positions: expand by trying all 26 x values × 25 plaintexts.
+    At determined positions: only 25 plaintexts, x is forced.
+    Prune to beam_width after each position.
+
+    Returns list of (score, plug_dict, full_decryption), best first.
+    """
+    L = len(cipher)
+    excluded = model.excluded
+
+    # State: (plug_dict, plaintext_list, cumulative_score)
+    states: list[tuple[dict[int, int], list[int], float]] = [({}, [], 0.0)]
+
+    for t in range(L):
+        ct = cipher[t]
+        Et = trajectory[t]
+        new_states: list[tuple[dict[int, int], list[int], float]] = []
+
+        for plug, pt, score in states:
+            for p in range(26):
+                if p == ct:
+                    continue
+                if pt and excluded[pt[-1]][p]:
+                    continue
+
+                p_known = p in plug
+                c_known = ct in plug
+
+                if p_known:
+                    # x is determined: x = plug[p]
+                    x = plug[p]
+                    y = Et[x]
+                    entries = [(p, x), (x, p), (y, ct), (ct, y)]
+                    new_plug = dict(plug)
+                    ok = True
+                    for k, v in entries:
+                        if k in new_plug:
+                            if new_plug[k] != v:
+                                ok = False
+                                break
+                        else:
+                            new_plug[k] = v
+                    if ok:
+                        new_states.append((new_plug, pt + [p], score + model.unigram[p]))
+
+                elif c_known:
+                    # x determined via c: y = plug[ct], x = Et[y]
+                    y = plug[ct]
+                    x = Et[y]  # E is involution
+                    entries = [(p, x), (x, p), (y, ct), (ct, y)]
+                    new_plug = dict(plug)
+                    ok = True
+                    for k, v in entries:
+                        if k in new_plug:
+                            if new_plug[k] != v:
+                                ok = False
+                                break
+                        else:
+                            new_plug[k] = v
+                    if ok:
+                        new_states.append((new_plug, pt + [p], score + model.unigram[p]))
+
+                else:
+                    # FREE: branch on all 26 x values
+                    for x in range(26):
+                        y = Et[x]
+                        entries = [(p, x), (x, p), (y, ct), (ct, y)]
+                        new_plug = dict(plug)
+                        ok = True
+                        for k, v in entries:
+                            if k in new_plug:
+                                if new_plug[k] != v:
+                                    ok = False
+                                    break
+                            else:
+                                new_plug[k] = v
+                        if ok:
+                            new_states.append((new_plug, pt + [p], score + model.unigram[p]))
+
+        # Beam prune: keep top states by score, dedup by plug state.
+        new_states.sort(key=lambda s: s[2], reverse=True)
+        seen: set[tuple[tuple[int, int], ...]] = set()
+        pruned: list[tuple[dict[int, int], list[int], float]] = []
+        for plug, pt, score in new_states:
+            key = tuple(sorted(plug.items()))
+            if key not in seen:
+                seen.add(key)
+                pruned.append((plug, pt, score))
+                if len(pruned) >= beam_width:
+                    break
+        states = pruned
+
+        if not states:
+            break
+
+    # Build results: decrypt full message with each surviving plugboard.
+    results: list[tuple[float, dict[int, int], list[int]]] = []
+    for plug, pt, score in states:
+        plug_map = list(range(26))
+        for a, b in plug.items():
+            plug_map[a] = b
+        dec = [plug_map[trajectory[t][plug_map[cipher[t]]]] for t in range(L)]
+        full_score = model.score(dec)
+        results.append((full_score, plug, dec))
+
+    results.sort(key=lambda r: r[0], reverse=True)
+    return results
