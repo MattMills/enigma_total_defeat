@@ -29,6 +29,8 @@ from enigma.pipeline import (
     crack_with_known_trajectory,
     crack_zero_knowledge,
 )
+from enigma.registry import REGISTRY, Domain, TechniqueRegistry, build_registry
+from enigma.scenarios import Scenario, make_scenario, all_single_scenarios
 
 __all__ = [
     "Enigma",
@@ -56,4 +58,11 @@ __all__ = [
     "crack_full",
     "crack_with_known_trajectory",
     "crack_zero_knowledge",
+    "REGISTRY",
+    "Domain",
+    "TechniqueRegistry",
+    "build_registry",
+    "Scenario",
+    "make_scenario",
+    "all_single_scenarios",
 ]
