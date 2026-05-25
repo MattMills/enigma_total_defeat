@@ -600,28 +600,48 @@ def beam_swap_search(
 
     Returns (score, plugboard_map, decrypted_ints).
     """
-    from enigma.ngram_data import BIGRAMS_OBSERVED, TRIGRAMS_OBSERVED, QUADGRAMS_OBSERVED
+    from enigma.ngram_data import (
+        BIGRAMS_OBSERVED, TRIGRAMS_OBSERVED, QUADGRAMS_OBSERVED,
+        BIGRAM_SUCCESSORS, TRIGRAM_SUCCESSORS,
+    )
 
     def decrypt(pl: list[int]) -> list[int]:
         return [pl[trajectory[t][pl[cipher[t]]]] for t in range(len(cipher))]
 
     def ngram_score(dec: list[int]) -> float:
-        """Score = count of valid n-grams (higher = better).
+        """Score by symbol-level transitions (bigram-of-bigrams, trigram-of-trigrams).
 
-        Weighted: quadgrams count most (most discriminating),
-        trigrams next, bigrams least.
+        Each valid transition at the bigram-symbol level means the
+        overlapping trigram is valid German. Each valid transition at
+        the trigram-symbol level means the overlapping quadgram is valid.
+
+        Weights: bigram-of-bigram (trigram) = 3, trigram-of-trigram (quadgram) = 5,
+        plus base bigram = 1.
         """
         n = len(dec)
         s = 0.0
+        # Base: character bigrams
         for i in range(n - 1):
             if (dec[i] * 26 + dec[i + 1]) in BIGRAMS_OBSERVED:
                 s += 1.0
-        for i in range(n - 2):
-            if (dec[i] * 676 + dec[i + 1] * 26 + dec[i + 2]) in TRIGRAMS_OBSERVED:
-                s += 3.0
-        for i in range(n - 3):
-            if (dec[i] * 17576 + dec[i + 1] * 676 + dec[i + 2] * 26 + dec[i + 3]) in QUADGRAMS_OBSERVED:
-                s += 5.0
+        # Bigram-of-bigram transitions
+        if n >= 3:
+            prev_bg = dec[0] * 26 + dec[1]
+            for i in range(1, n - 1):
+                cur_bg = dec[i] * 26 + dec[i + 1]
+                succ = BIGRAM_SUCCESSORS.get(prev_bg)
+                if succ is not None and cur_bg in succ:
+                    s += 3.0
+                prev_bg = cur_bg
+        # Trigram-of-trigram transitions
+        if n >= 4:
+            prev_tg = dec[0] * 676 + dec[1] * 26 + dec[2]
+            for i in range(1, n - 2):
+                cur_tg = dec[i] * 676 + dec[i + 1] * 26 + dec[i + 2]
+                succ = TRIGRAM_SUCCESSORS.get(prev_tg)
+                if succ is not None and cur_tg in succ:
+                    s += 5.0
+                prev_tg = cur_tg
         return s
 
     def apply_swap(plug: list[int], a: int, b: int) -> list[int]:
