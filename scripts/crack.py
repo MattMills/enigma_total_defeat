@@ -22,7 +22,7 @@ import time
 
 from enigma.language import LanguageModel
 from enigma.messages import MESSAGES, EnigmaMessage, MachineType, get_message
-from enigma.pipeline import crack_full, crack_with_known_trajectory, PipelineResult
+from enigma.pipeline import crack_full, crack_with_known_trajectory, crack_zero_knowledge, PipelineResult
 from enigma.simulator import (
     Enigma, Plugboard,
     M3_ROTORS, NAVAL_ROTORS, GREEK_ROTORS, M3_REFLECTORS, M4_REFLECTORS,
@@ -83,7 +83,35 @@ def crack(msg: EnigmaMessage, model: LanguageModel, time_limit: float = 120.0) -
         )
         return _from_pipeline_result(result)
 
-    # --- Unknown position: use full pipeline ---
+    # --- Zero knowledge: use hierarchical phase-space solver ---
+    if not known_rotors and not known_pos:
+        # Collect same-day messages for cross-validation
+        same_day = [ct]
+        if msg.date:
+            for other in MESSAGES:
+                if other.id != msg.id and other.date == msg.date:
+                    other_ct = "".join(c for c in other.ciphertext if "A" <= c <= "Z")
+                    if len(other_ct) >= 20:
+                        same_day.append(other_ct)
+
+        results = crack_zero_knowledge(
+            same_day,
+            model=model,
+            rotor_pool=rotor_pool,
+            reflector_names=tuple(reflectors),
+            beam_rounds=10,
+            beam_width=50,
+            search_rings=True,
+            time_limit=time_limit,
+            progress=True,
+            fourth_rotors=fourth_rotors,
+            fourth_positions=fourth_positions,
+        )
+        if not results:
+            return None
+        return _from_pipeline_result(results[0])
+
+    # --- Partial knowledge: use full pipeline ---
     results = crack_full(
         ct,
         model=model,

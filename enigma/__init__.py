@@ -27,6 +27,7 @@ from enigma.pipeline import (
     PipelineResult,
     crack_full,
     crack_with_known_trajectory,
+    crack_zero_knowledge,
 )
 
 __all__ = [
@@ -54,4 +55,5 @@ __all__ = [
     "PipelineResult",
     "crack_full",
     "crack_with_known_trajectory",
+    "crack_zero_knowledge",
 ]
