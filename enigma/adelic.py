@@ -368,69 +368,76 @@ def run_adelic(
         for m in manifolds:
             space.project(m.spread())
 
-        # === Phase 2: Compute direct evidence using current beliefs ===
-        # Read current best from all manifolds
+        # === Phase 2: Compute direct evidence ===
+        # Structural manifolds use IC (plugboard-INVARIANT).
+        # Plug manifolds use n-grams (requires trajectory to be ~correct).
+        # This gives natural phasing: structure resolves first, then plugboard.
+
         ci = m_combo.best()
         ri = m_refl.best()
-        pL = m_pos_L.best()
-        pM = m_pos_M.best()
-        pR = m_pos_R.best()
-        rM = m_ring_M.best()
-        rR = m_ring_R.best()
-        plug_map = [m_plug[a].best() for a in range(26)]
+        pL = m_pos_L.best() % 26
+        pM = m_pos_M.best() % 26
+        pR = m_pos_R.best() % 26
+        rM = m_ring_M.best() % 26
+        rR = m_ring_R.best() % 26
+        plug_map = [m_plug[a].best() % 26 for a in range(26)]
 
         combo = all_combos[ci % len(all_combos)]
         refl = reflector_pool[ri % len(reflector_pool)]
-        pos = (pL % 26, pM % 26, pR % 26)
-        ring = (0, rM % 26, rR % 26)
+        pos = (pL, pM, pR)
+        ring = (0, rM, rR)
 
-        # Get trajectory at current best config
-        traj = fast_trajectory(combo, refl, pos, ring, L)
-
-        # Decrypt with current plug beliefs
-        dec = [plug_map[traj[t][plug_map[cipher[t]]]] for t in range(L)]
-        base_score = _ngram_score(dec)
-
-        # --- Combo evidence ---
+        # --- Combo evidence (IC-based, plugboard invariant) ---
+        # Each combo evaluated at MULTIPLE positions (not just current best)
+        # This prevents lock-in to wrong combo due to wrong starting position
         combo_ev = [0.0] * len(all_combos)
+        # Sample positions: current best + random spread across CRT residues
+        pos_samples = [(pL, pM, pR)]
+        for pr_sample in range(0, 26, 5):
+            for pm_sample in range(0, 26, 9):
+                pos_samples.append((pL, pm_sample, pr_sample))
         for idx, c in enumerate(all_combos):
-            t2 = fast_trajectory(c, refl, pos, ring, L)
-            d2 = [plug_map[t2[t][plug_map[cipher[t]]]] for t in range(L)]
-            combo_ev[idx] = _ngram_score(d2)
-        # Add interference signal from shared space
+            best_ic = 0.0
+            for p_sample in pos_samples:
+                t2 = fast_trajectory(c, refl, p_sample, ring, L)
+                d2 = [t2[t][cipher[t]] for t in range(L)]
+                ic = index_of_coincidence(d2)
+                if ic > best_ic:
+                    best_ic = ic
+            combo_ev[idx] = best_ic * 1000
         interference = space.extract(m_combo.code)
-        combo_ev = [e + interference * 0.1 for e in combo_ev]
-        m_combo.state.accumulate_base(
-            list(m_combo.state.components.keys())[0],
-            combo_ev[:list(m_combo.state.components.keys())[0]],
-            T,
-        )
+        combo_ev = [e + interference * 0.5 for e in combo_ev]
+        # Update all prime bases of combo manifold
+        for base in m_combo.state.components:
+            base_ev = [0.0] * base
+            for r in range(base):
+                vals = [v for v in range(len(all_combos)) if v % base == r]
+                base_ev[r] = max(combo_ev[v] for v in vals) if vals else 0
+            m_combo.state.accumulate_base(base, base_ev, T)
 
-        # --- Position R evidence (26 values) ---
+        # --- Position R evidence (IC-based) ---
+        combo = all_combos[m_combo.best() % len(all_combos)]
         pos_r_ev = [0.0] * 26
         for pr in range(26):
             t2 = fast_trajectory(combo, refl, (pL, pM, pr), ring, L)
-            d2 = [plug_map[t2[t][plug_map[cipher[t]]]] for t in range(L)]
-            pos_r_ev[pr] = _ngram_score(d2)
-        # Add interference
+            d2 = [t2[t][cipher[t]] for t in range(L)]
+            pos_r_ev[pr] = index_of_coincidence(d2) * 1000
         interference_r = space.extract(m_pos_R.code)
-        pos_r_ev = [e + interference_r * 0.1 for e in pos_r_ev]
-        # Update each prime base
+        pos_r_ev = [e + interference_r * 0.5 for e in pos_r_ev]
         for base in m_pos_R.state.components:
             base_ev = [0.0] * base
             for r in range(base):
-                # Average evidence across all values with this residue
-                vals_with_r = [v for v in range(26) if v % base == r]
-                base_ev[r] = max(pos_r_ev[v] for v in vals_with_r) if vals_with_r else 0
+                vals = [v for v in range(26) if v % base == r]
+                base_ev[r] = max(pos_r_ev[v] for v in vals) if vals else 0
             m_pos_R.state.accumulate_base(base, base_ev, T)
 
-        # --- Position M evidence ---
+        # --- Position M evidence (IC-based) ---
+        pR = m_pos_R.best() % 26
         pos_m_ev = [0.0] * 26
-        pR = m_pos_R.best()
         for pm in range(26):
             t2 = fast_trajectory(combo, refl, (pL, pm, pR), ring, L)
-            d2 = [plug_map[t2[t][plug_map[cipher[t]]]] for t in range(L)]
-            pos_m_ev[pm] = _ngram_score(d2)
+            d2 = [t2[t][cipher[t]] for t in range(L)]
+            pos_m_ev[pm] = index_of_coincidence(d2) * 1000
         for base in m_pos_M.state.components:
             base_ev = [0.0] * base
             for r in range(base):
@@ -438,13 +445,13 @@ def run_adelic(
                 base_ev[r] = max(pos_m_ev[v] for v in vals) if vals else 0
             m_pos_M.state.accumulate_base(base, base_ev, T)
 
-        # --- Position L evidence ---
+        # --- Position L evidence (IC-based) ---
+        pM = m_pos_M.best() % 26
         pos_l_ev = [0.0] * 26
-        pM = m_pos_M.best()
         for pl in range(26):
             t2 = fast_trajectory(combo, refl, (pl, pM, pR), ring, L)
-            d2 = [plug_map[t2[t][plug_map[cipher[t]]]] for t in range(L)]
-            pos_l_ev[pl] = _ngram_score(d2)
+            d2 = [t2[t][cipher[t]] for t in range(L)]
+            pos_l_ev[pl] = index_of_coincidence(d2) * 1000
         for base in m_pos_L.state.components:
             base_ev = [0.0] * base
             for r in range(base):
@@ -452,14 +459,14 @@ def run_adelic(
                 base_ev[r] = max(pos_l_ev[v] for v in vals) if vals else 0
             m_pos_L.state.accumulate_base(base, base_ev, T)
 
-        # --- Ring R evidence ---
-        pL = m_pos_L.best()
+        # --- Ring R evidence (IC-based) ---
+        pL = m_pos_L.best() % 26
         pos = (pL, pM, pR)
         ring_r_ev = [0.0] * 26
         for rr in range(26):
             t2 = fast_trajectory(combo, refl, pos, (0, rM, rr), L)
-            d2 = [plug_map[t2[t][plug_map[cipher[t]]]] for t in range(L)]
-            ring_r_ev[rr] = _ngram_score(d2)
+            d2 = [t2[t][cipher[t]] for t in range(L)]
+            ring_r_ev[rr] = index_of_coincidence(d2) * 1000
         for base in m_ring_R.state.components:
             base_ev = [0.0] * base
             for r in range(base):
@@ -467,53 +474,60 @@ def run_adelic(
                 base_ev[r] = max(ring_r_ev[v] for v in vals) if vals else 0
             m_ring_R.state.accumulate_base(base, base_ev, T)
 
-        # --- Plug manifolds ---
-        rR = m_ring_R.best()
+        # --- Plug manifolds (n-gram scored, only active once structure stabilizes) ---
+        rR = m_ring_R.best() % 26
         ring = (0, rM, rR)
+        structural_entropy = sum(m.entropy() for m in [m_combo, m_pos_L, m_pos_M, m_pos_R])
         traj = fast_trajectory(combo, refl, pos, ring, L)
 
-        for a in range(26):
-            plug_ev = [0.0] * 26
-            for b in range(26):
-                test_plug = list(plug_map)
-                old_pa = test_plug[a]
-                old_pb = test_plug[b]
-                test_plug[a] = b
-                test_plug[b] = a
-                if old_pa != a and old_pa != b:
-                    test_plug[old_pa] = old_pa
-                if old_pb != b and old_pb != a and old_pb != old_pa:
-                    test_plug[old_pb] = old_pb
-                d2 = [test_plug[traj[t][test_plug[cipher[t]]]] for t in range(L)]
-                plug_ev[b] = _ngram_score(d2)
-            # Add interference from other plug manifolds
-            plug_interference = space.extract(m_plug[a].code)
-            plug_ev = [e + plug_interference * 0.05 for e in plug_ev]
-            for base in m_plug[a].state.components:
-                base_ev = [0.0] * base
-                for r in range(base):
-                    vals = [v for v in range(26) if v % base == r]
-                    base_ev[r] = max(plug_ev[v] for v in vals) if vals else 0
-                m_plug[a].state.accumulate_base(base, base_ev, T)
+        # Only update plugboard once structural manifolds have low entropy
+        # (prevents plugboard from overfitting to wrong trajectory)
+        if structural_entropy < 5.0:
+            # Build 26×26 score matrix: M[a][b] = score if P(a)=b
+            plug_matrix = [[0.0] * 26 for _ in range(26)]
+            for a in range(26):
+                for b in range(26):
+                    test_plug = list(plug_map)
+                    old_a = test_plug[a]
+                    test_plug[a] = b
+                    test_plug[b] = a
+                    if old_a != a and old_a != b:
+                        test_plug[old_a] = old_a
+                    d2 = [test_plug[traj[t][test_plug[cipher[t]]]] for t in range(L)]
+                    plug_matrix[a][b] = _ngram_score(d2)
 
-        # === Phase 3: Involution constraint propagation ===
-        for a in range(26):
-            for b in range(26):
-                fb_a = m_plug[a].state.full_belief()
-                fb_b = m_plug[b].state.full_belief()
-                # Symmetrize: P(a)=b ⟹ P(b)=a
-                avg = (fb_a[b] + fb_b[a]) / 2
-                # Push back into prime bases
-                for base, vec in m_plug[a].state.components.items():
-                    r = b % base
-                    vec[r] = (vec[r] + avg) / 2
-                for base, vec in m_plug[b].state.components.items():
-                    r = a % base
-                    vec[r] = (vec[r] + avg) / 2
-            # Renormalize
-            for base, vec in m_plug[a].state.components.items():
-                total = sum(vec) or 1e-12
-                m_plug[a].state.components[base] = [v / total for v in vec]
+            # Symmetrize (involution): M[a][b] should equal M[b][a]
+            for a in range(26):
+                for b in range(a + 1, 26):
+                    avg = (plug_matrix[a][b] + plug_matrix[b][a]) / 2
+                    plug_matrix[a][b] = avg
+                    plug_matrix[b][a] = avg
+
+            # Sinkhorn projection → doubly-stochastic (permutation constraint)
+            # Apply temperature first
+            max_m = max(plug_matrix[a][b] for a in range(26) for b in range(26))
+            for a in range(26):
+                for b in range(26):
+                    plug_matrix[a][b] = math.exp((plug_matrix[a][b] - max_m) / T)
+            for _ in range(15):
+                for a in range(26):
+                    rs = sum(plug_matrix[a]) or 1e-12
+                    plug_matrix[a] = [v / rs for v in plug_matrix[a]]
+                for b in range(26):
+                    cs = sum(plug_matrix[a][b] for a in range(26)) or 1e-12
+                    for a in range(26):
+                        plug_matrix[a][b] /= cs
+
+            # Push Sinkhorn result back into per-letter manifold prime bases
+            for a in range(26):
+                row = plug_matrix[a]
+                for base in m_plug[a].state.components:
+                    base_ev = [0.0] * base
+                    for r in range(base):
+                        vals = [v for v in range(26) if v % base == r]
+                        base_ev[r] = sum(row[v] for v in vals)
+                    total = sum(base_ev) or 1e-12
+                    m_plug[a].state.components[base] = [v / total for v in base_ev]
 
         # === Phase 4: FEC coherence check ===
         coherence = space.entropy_check()
