@@ -19,18 +19,30 @@ Verified against the simulator:
 
     so M4 needs no new table format — only a larger reflector alphabet.
 
-Because of that law, resolution never materialises the
-336 x 104 x 26³ ≈ 6.1x10⁸-entry table (~7.4 GB flat). From a full geometry,
+Because of that law the landscape is **generative, not stored**. Every
+geometry is recomputed from the wirings in microseconds, so there is no
+large M4 dataset: over M3, the only new data is the wirings for the naval
+rotors + Greek wheels (~182 bytes) plus the 104 effective reflectors
+(~2.7 KB, and themselves derived from those wirings in ~1 ms). The
+336 x 104 x 26³ ≈ 6.1x10⁸-entry *flat* table (~9.8 GB) is deliberately NOT
+built — materialising it would only cache a function that is already cheap.
+
+The Greek wheel and thin reflector do not step, so ``U'`` is CONSTANT for a
+whole message: an M4 is, from the three stepping rotors' point of view, just
+an M3 with one of 104 fixed reflectors. (Historically this is why Beta at
+position A + B-thin reproduces UKW-B exactly — M4 was backward compatible
+with M3.)
+
+Resolution uses only the conjugation. From a full geometry,
 
         W · E · W⁻¹ = U'
 
 so scanning ``(triple, offsets)`` and testing whether ``W E W⁻¹`` is one of
 the 104 effective reflectors recovers the ENTIRE 4-rotor configuration —
 rotor order, offsets, Greek wheel, thin reflector and Greek offset — in a
-few seconds. The precomputed "index" that matters is therefore tiny: the
-104-entry effective-reflector table. A compact rainbow-table serialization
-of a config slice is provided for interoperability, but the conjugation
-resolver is the efficient path.
+few seconds, with no stored table. :meth:`M4Landscape.serialize_slice` is an
+OPTIONAL interchange format for a single config slice (never the whole
+space); it is not how the resolver works.
 """
 
 from __future__ import annotations

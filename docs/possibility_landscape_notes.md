@@ -98,3 +98,30 @@ space:
   beam-search / hyperchart code). The value is decomposition: an intractable
   joint (rotor × plugboard) search becomes rotor lookup, then a much smaller
   plugboard solve.
+
+## 5. M4 is a *small* addition, not a bigger table
+
+The Kriegsmarine M4 adds a Greek 4th wheel (Beta/Gamma) and a thin reflector
+(B-thin/C-thin) inboard of the stack. **Neither steps during a message**, so
+they fold into a single effective reflector `U' = G⁻¹ · U_thin · G` that is
+*constant* for the whole message. From the three stepping rotors' point of
+view, an M4 is just an M3 with one of **104** fixed reflectors (2 greek × 2
+thin × 26 greek offsets). Historically this is exactly why **Beta @ A +
+B-thin reproduces UKW-B** and Gamma @ A + C-thin reproduces UKW-C — M4 was
+backward compatible with M3 (both verified in `enigma/landscape_m4.py`).
+
+Consequently there is **no large M4 dataset**. The geometry law
+`E = W⁻¹ · U' · W` is generative:
+
+| what | size |
+|------|------|
+| new wirings over M3 (VI, VII, VIII, Beta, Gamma, B-thin, C-thin) | ~182 bytes |
+| 104 effective reflectors (derived in ~1 ms; cached) | ~2.7 KB |
+| flat `(triple, offset, reflector) → E` table | ~9.8 GB — **not built** |
+
+Resolution uses the conjugation `W · E · W⁻¹ = U'`: scan `(triple, offsets)`,
+test whether the conjugate is one of the 104 reflectors, and read off the
+entire 4-rotor config (rotors, offsets, Greek wheel, thin reflector, Greek
+offset) — no stored table. The flat table would only cache an already-cheap
+function, so it is deliberately avoided; slice serialization exists purely as
+an optional interchange format.

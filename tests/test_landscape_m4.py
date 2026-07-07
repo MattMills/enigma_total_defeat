@@ -63,6 +63,25 @@ def test_geometry_matches_real_m4_machine():
     _ = machine  # machine constructed to assert the config is valid M4
 
 
+def test_effective_reflector_is_constant_within_a_message():
+    """Greek wheel + thin reflector do not step, so U' is fixed all message."""
+    m = Enigma(rotor_names=("I", "II", "III"), reflector_name="B-thin",
+               positions=[0, 0, 0], ring_settings=[0, 0, 0],
+               fourth_rotor_name="Beta", fourth_position=7)
+    before = m.fourth_position
+    m.encrypt("A" * 60)
+    assert m.fourth_position == before  # 4th wheel never moved
+
+
+def test_m4_backward_compatible_with_m3():
+    """Beta@A + B-thin == UKW-B ; Gamma@A + C-thin == UKW-C."""
+    from enigma.simulator import REFLECTORS
+    assert effective_reflector(GreekSetting("Beta", "B-thin", 0)) == \
+        REFLECTORS["B"].wiring
+    assert effective_reflector(GreekSetting("Gamma", "C-thin", 0)) == \
+        REFLECTORS["C"].wiring
+
+
 def test_resolve_recovers_full_config():
     land = M4Landscape()
     triple = ("I", "IV", "VII")
