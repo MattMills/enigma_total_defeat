@@ -38,17 +38,18 @@ jobs:
           python -m venv "$RUNNER_TEMP/venv"
           echo "$RUNNER_TEMP/venv/bin" >> "$GITHUB_PATH"
 
-      # The package itself is pure standard library; only the test runner is needed.
+      # The package itself is pure standard library; only the test runner is
+      # needed (pytest-xdist spreads both tiers over the runner's cores).
       - name: Install dependencies
-        run: pip install --prefer-binary pytest
+        run: pip install --prefer-binary pytest pytest-xdist
 
       - name: Run unit tests (fast)
-        run: python -m pytest -q
+        run: python -m pytest -q -n auto
         env:
           PYTHONPATH: ${{ github.workspace }}
 
       - name: Run end-to-end attack test (slow)
-        run: python -m pytest -q -m slow
+        run: python -m pytest -q -n auto -m slow
         env:
           PYTHONPATH: ${{ github.workspace }}
 
